@@ -51,8 +51,8 @@ local options = {
     hdr_cmd_path = "C:\\Program Files\\mpv\\HDRCmd.exe",
     
     -- 显示器切换 HDR 的黑屏物理握手耗时（秒）
-    -- 脚本在此期间自动暂停视频。若屏幕点亮较慢可微调至 2.0
-    handshake_delay = 1.5,
+    -- 脚本在此期间自动暂停视频。若屏幕点亮较慢可微调至 3.0
+    handshake_delay = 2.5,
     
     -- 停止/播完后延迟关闭 HDR 的缓冲时间（秒）
     -- 为切集、选片提供防抖保护，避免关了又开
