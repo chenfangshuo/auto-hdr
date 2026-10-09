@@ -1,63 +1,57 @@
 # MPV Auto HDR Switcher for Windows
 
-为 Windows 10/11 打造的 MPV 自动 HDR 切换脚本。针对原生硬解元数据丢失、显示器切 HDR 黑屏漏帧、播放列表切集反复闪烁等痛点进行了深度优化。
+播放 HDR 影片时自动打开 Windows 的 HDR，播放 SDR 内容时自动切回 —— 不用再手动按 Win+Alt+B。
 
----
+## 实际体验
 
-## 🎬 场景表现一览
+| 场景 | 你会看到 |
+| :--- | :--- |
+| 打开 HDR 电影 | 从片头开始播，不漏首帧 |
+| 连播 / 手动切集 | HDR 保持常亮，没有二次黑屏闪烁 |
+| 拖动进度条 / 暂停 / 继续 | 不会重复触发切换 |
+| 切到 SDR 视频 | 一次黑屏后切回 SDR，从片头续播 |
+| 正常播完（停在最后一帧） | HDR 保持常亮，播完还能拖进度条回去回看，不会突然切回 SDR |
+| 手动停止 / 关掉当前文件 | 等 2.5 秒确认没有新任务，再切回 SDR |
+| 直接点 ✕ 退出 | 随播放器退出，立即恢复 SDR |
+| 系统本来开着 HDR | 看完不会替你关掉 |
+| 显示器不支持 HDR | 脚本自动跳过，没有任何停顿 |
+| 播放中自己改了 HDR | 脚本以真实状态为准，不会和你抢 |
 
-| 场景 | 脚本行为 | 实际体验 |
-| :--- | :--- | :--- |
-| **打开 HDR 电影** | 自动呼叫开启系统 HDR，同时强制暂停视频 | 预留 3.8 秒等显示器黑屏握手完成，亮屏即从头开播，**不漏首帧** |
-| **连播 / 手动切集** | 检测到新视频仍是 HDR，直接取消关机倒计时 | 系统 HDR 保持常亮，**完全无黑屏二次闪烁** |
-| **进度条快进 / 暂停** | 记录当前视频路径，命中防打扰机制 | **零弹窗、零误触**，不重复触发检测逻辑 |
-| **切到 SDR 视频** | 识别为非 HDR 内容，触发 2.5 秒延迟关闭HDR | 画面先行，平滑切回系统 SDR |
-| **正常播完 / 停止** | 启动 2.5 秒“防抖倒计时” | 倒计时结束无新任务再切回 SDR，避免误操作频繁闪烁 |
-| **直接点击 ✕ 退出** | 拦截 `quit` 退出事件，同步下发关HDR指令 | 随播放器退出**瞬时恢复 SDR** |
-| **系统本就开着 HDR** | 读取系统真实状态并标记为外部开启 | 看完不越权关闭，**维持系统原有 HDR 状态** |
+## 安装
 
----
+**1. 准备 `HDRCmd.exe`**
 
-## ✨ 核心特性
+到 [HDRTray Releases](https://github.com/res2k/HDRTray/releases) 下载压缩包，解压出 `HDRCmd.exe`，
+放到 `C:\Program Files\mpv\`（换别的位置也行，但要同步改脚本里的 `hdr_cmd_path`）。
 
-* **PowerShell 代理调用**：解决安装在受保护目录（如 `Program Files`）下直接调起子进程导致的权限沙盒崩溃。
-* **原生硬解（D3D11VA）兼容**：除常规 `color-trc` 外，深入读取 `d3d11va` 硬解通道的 `gamma` 属性，无需妥协回拷模式。
-* **双层判定 + 文件名兜底**：元数据异常时自动检索文件名关键字（HDR / DV / DoVi / PQ），杜绝漏判。
-* **物理防抖（Debounce）调度**：采用异步非阻塞调用，切集平滑无感，MPV 界面不卡顿假死。
+**2. 放入脚本**
 
----
+把 `auto-hdr.lua` 放进 mpv 的脚本目录：
 
-## 🛠️ 安装与使用
-
-### 1. 下载依赖
-本脚本依赖 `HDRCmd.exe` 控制系统 HDR 状态：
-* 前往 [HDRTray Releases (by res2k)](https://github.com/res2k/HDRTray/releases) 下载最新压缩包。
-* 解压出 **`HDRCmd.exe`**，放置于 `C:\Program Files\mpv\`（或任意你喜欢的路径）。
-
-### 2. 部署脚本
-将 `auto-hdr.lua` 放入 MPV 的脚本文件夹：
+* **便携版**：`mpv\portable_config\scripts\`
 * **普通安装版**：`%APPDATA%\mpv\scripts\`
-* **便携版 (Portable)**：`mpv\portable_config\scripts\`
 
----
+**3. 确认能读到 HDR 状态**
 
-## ⚙️ 参数配置
+PowerShell 里执行下面两条，第二条返回 `exit=1` 表示当前 HDR 是关的（开着则是 `exit=0`）：
 
-用文本编辑器打开 `auto-hdr.lua`，可在顶部的 `options` 区域微调参数：
+```powershell
+& 'C:\Program Files\mpv\HDRCmd.exe' status
+& 'C:\Program Files\mpv\HDRCmd.exe' status -m x; "exit=$LASTEXITCODE"
+```
 
-```lua
-local options = {
-    -- HDRCmd.exe 绝对路径（Lua 路径中请使用双反斜杠 \\）
-    hdr_cmd_path = "C:\\Program Files\\mpv\\HDRCmd.exe",
-    
-    -- 显示器切换 HDR 的黑屏物理握手耗时（秒）
-    -- 脚本在此期间自动暂停视频。可根据自己屏幕切换HDR黑屏时间进行微调
-    handshake_delay = 3.8,
-    
-    -- 停止/播完后延迟关闭 HDR 的缓冲时间（秒）
-    -- 为切集、选片提供防抖保护，避免关了又开
-    turn_off_delay = 2.5,
-    
-    -- 属性检测最大轮询次数（每 0.2 秒一次，25 次即 5 秒超时后触发文件名兜底）
-    max_check_attempts = 25
-}
+## 调参
+
+只需要改 `auto-hdr.lua` 顶部的 `options`，日常通常只动这两个：
+
+| 参数 | 默认 | 什么时候改 |
+| :--- | :--- | :--- |
+| `hdr_cmd_path` | `C:\Program Files\mpv\HDRCmd.exe` | HDRCmd.exe 不在这个位置时（路径里的 `\` 写成 `\\`） |
+| `handshake_delay_on` / `_off` | `3.8` / `3.8` | 黑屏结束了还在等 → 调小；画面亮了才开始播 → 调大 |
+
+其余参数、判定逻辑与排错方法见 **[DEVELOPER.md](DEVELOPER.md)**。
+
+## 注意
+
+* **多显示器**：`HDRCmd.exe` 会连带切换**所有**支持 HDR 的屏幕，脚本不区分主副屏。
+* **只关自己开的**：系统 HDR 如果是你手动开的，脚本看完不会替你关。
