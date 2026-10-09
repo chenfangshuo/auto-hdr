@@ -120,7 +120,16 @@ HDR 就保持开启 —— 这正是想要的：播完往往还要拖进度条�
 
 ## 6. 排错
 
-把 `debug` 改成 `true`，然后看 mpv 日志（前缀 `[auto_hdr]`）：
+**第一步先自检依赖**（PowerShell 里执行；第二条返回 `exit=1` 表示当前 HDR 是关的，开着则是 `exit=0`）：
+
+```powershell
+& 'C:\Program Files\mpv\HDRCmd.exe' status
+& 'C:\Program Files\mpv\HDRCmd.exe' status -m x; "exit=$LASTEXITCODE"
+```
+
+两条都正常再往下看日志；报"找不到文件/命令"就是 `hdr_cmd_path` 配错了。
+
+然后**把 `debug` 改成 `true`**，看 mpv 日志（前缀 `[auto_hdr]`）：
 
 * **终端版**：`mpv.com` 直接可见；`mpv.exe` 按 `~` 打开控制台。
 * info 级消息默认就会显示，通常不需要额外加 `--msg-level`。
