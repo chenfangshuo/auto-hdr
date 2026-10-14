@@ -42,6 +42,8 @@ $modeFail    = Join-Path $work "mode-fail"
 $modeNoHdr   = Join-Path $work "mode-unsupported"
 $modeOffFail = Join-Path $work "mode-off-fail"
 $modeSlowOn  = Join-Path $work "mode-slow-on"
+$modeSlowSt  = Join-Path $work "mode-slow-status"
+$modeSlowOff = Join-Path $work "mode-slow-off"
 
 $stubSource = Join-Path $PSScriptRoot "stub-hdrcmd.cs"
 if (-not (Test-Path $stubSource)) { throw "找不到 $stubSource" }
@@ -86,6 +88,12 @@ function Write-NextHelper([double]$Seconds) {
 function Write-ProbeHelper([double]$Seconds) {
     $lua = "mp.add_timeout($Seconds, function() mp.msg.info(`"TESTPROBE pause=`" .. tostring(mp.get_property_bool(`"pause`"))) end)`r`n"
     [System.IO.File]::WriteAllText($probeHelper, $lua, $utf8NoBom)
+}
+# 到点后加载另一个文件（模拟"防抖关闭还没落地，用户就打开了下一部"）
+$loadHelper = Join-Path $work "testload.lua"
+function Write-LoadHelper([double]$Seconds, [string]$File) {
+    $lua = "mp.add_timeout($Seconds, function() mp.commandv(`"loadfile`", `"$($File -replace '\\','/')`") end)`r`n"
+    [System.IO.File]::WriteAllText($loadHelper, $lua, $utf8NoBom)
 }
 
 # ---------- 3. 测试用的 auto-hdr.lua 副本（指向 stub、缩短握手、开 debug）----------
@@ -140,7 +148,7 @@ $testLongVideo = "av://lavfi:testsrc=size=64x64:rate=5:duration=30"
 
 # ---------- 工具函数 ----------
 function Reset-Stub {
-    Remove-Item $callsPath, $statePath, $modeFail, $modeNoHdr, $modeOffFail, $modeSlowOn `
+    Remove-Item $callsPath, $statePath, $modeFail, $modeNoHdr, $modeOffFail, $modeSlowOn, $modeSlowSt, $modeSlowOff `
         -Force -ErrorAction SilentlyContinue
 }
 function Set-StubMode([string]$Mode) {
@@ -148,6 +156,8 @@ function Set-StubMode([string]$Mode) {
     if ($Mode -eq "unsupported") { New-Item -ItemType File -Path $modeNoHdr   | Out-Null }
     if ($Mode -eq "offfail")     { New-Item -ItemType File -Path $modeOffFail | Out-Null }
     if ($Mode -eq "slowon")      { New-Item -ItemType File -Path $modeSlowOn  | Out-Null }
+    if ($Mode -eq "slowstatus")  { New-Item -ItemType File -Path $modeSlowSt  | Out-Null }
+    if ($Mode -eq "slowoff")     { New-Item -ItemType File -Path $modeSlowOff | Out-Null }
 }
 function Get-Calls {
     if (-not (Test-Path $callsPath)) { return @() }
@@ -162,6 +172,8 @@ function Invoke-Mpv {
         [int]$StopAfter = 0,
         [double]$NextAfter = 0,
         [double]$ProbeAfter = 0,
+        [double]$LoadAfter = 0,
+        [string]$LoadFile = "",
         [string]$ScriptPath = $testScript
     )
     Write-QuitHelper $QuitAfter
@@ -171,6 +183,7 @@ function Invoke-Mpv {
     if ($StopAfter -gt 0)  { Write-StopHelper $StopAfter;   $helpers += $stopHelper }
     if ($NextAfter -gt 0)  { Write-NextHelper $NextAfter;   $helpers += $nextHelper }
     if ($ProbeAfter -gt 0) { Write-ProbeHelper $ProbeAfter; $helpers += $probeHelper }
+    if ($LoadAfter -gt 0)  { Write-LoadHelper $LoadAfter $LoadFile; $helpers += $loadHelper }
     $mpvArgs = @("--no-config", "--vo=null", "--ao=null", "--keep-open=yes",
                  "--script=$ScriptPath") + ($helpers | ForEach-Object { "--script=$_" }) + $Extra + $Files
     $p = Start-Process -FilePath $MpvPath -ArgumentList $mpvArgs -NoNewWindow -PassThru `
@@ -198,6 +211,8 @@ function Test-Case {
         [int]$StopAfter = 0,
         [double]$NextAfter = 0,
         [double]$ProbeAfter = 0,
+        [double]$LoadAfter = 0,
+        [string]$LoadFile = "",
         [switch]$BadPath,
         [string[]]$Extra = @(),
         [string[]]$Expect = @(),
@@ -217,6 +232,7 @@ function Test-Case {
 
     $log = Invoke-Mpv -Files $files -QuitAfter $QuitAfter -Extra $Extra -StopAfter $StopAfter `
                       -NextAfter $NextAfter -ProbeAfter $ProbeAfter `
+                      -LoadAfter $LoadAfter -LoadFile $LoadFile `
                       -ScriptPath $(if ($BadPath) { $testScriptBad } else { $testScript })
     $logText = ($log -join "`n")
     $calls = Get-Calls
@@ -299,13 +315,27 @@ Test-Case -Name "off 失败 → 退出时不谎报关闭，留给 shutdown 重�
 
 Test-Case -Name "停止播放打断在途的 on → 空闲不留 HDR" -Media @("long.HDR.wav") -Mode "slowon" `
     -StopAfter 1 -QuitAfter 12 -Extra @("--idle=yes") `
-    -Expect @("回调时文件已变化", "播放结束且无新视频：关闭系统 HDR") `
+    -Expect @("回调返回时文件已变化", "播放结束且无新视频：关闭系统 HDR") `
     -CallsMatch "^status,on,off$"
 
 Test-Case -Name "命令在途时切到 SDR → 旧结论不套用到新文件" -Mode "slowon" -NextAfter 0.6 `
     -QuitAfter 10 -Extra @("--idle=yes") -List @("long.HDR.wav", $testLongVideo) `
-    -Expect @("回调时文件已变化", "HDR 已关闭（元数据") `
+    -Expect @("回调返回时文件已变化", "HDR 已关闭（元数据") `
     -CallsMatch "^status,on,off$"
+
+Test-Case -Name "状态查询在途时切到 SDR → 判定直接丢弃" -Mode "slowstatus" -NextAfter 0.6 `
+    -QuitAfter 10 -Extra @("--idle=yes") -List @("long.HDR.wav", $testLongVideo) `
+    -Expect @("状态查询回调时文件已变化") -ExpectAbsent @("HDR 已开启") `
+    -CallsMatch "^status$"
+
+# 片尾防抖的 off 正在跑（慢速 1.5s），用户在这期间打开了下一部 HDR 片：
+# 新片会因缓存/查询认为"系统已是 HDR"而放行，等 off 落地后必须回头补一次判断，
+# 否则 HDR 片会在 SDR 下播完（stub 的 state.on 被删掉、脚本却以为无事可做）
+Test-Case -Name "防抖关闭在途时打开新 HDR 片 → 关闭落地后会补开" -Mode "slowoff" -StopAfter 1 `
+    -LoadAfter 3.6 -LoadFile (Join-Path $work "long.HDR.wav") -QuitAfter 12 -Extra @("--idle=yes") `
+    -Media @("long.HDR.wav") `
+    -Expect @("回调返回时文件已变化", "HDR 已开启") `
+    -CallsMatch "off,.*on,off$"
 
 Test-Case -Name "--pause 启动 → 脚本不解除用户的暂停" -Media @("movie.HDR.wav") -QuitAfter 6 `
     -Extra @("--pause") -ProbeAfter 5 `

@@ -6,13 +6,15 @@
 // 用 Add-Type / csc.exe 把它编出来，不往仓库里放二进制。
 //
 // 行为对齐真实 HDRCmd 的退出码语义：
-//   status  有 mode-unsupported → 2（没有支持 HDR 的显示器）
+//   status  有 mode-slow-status 时先睡 1.5 秒（构造"状态查询还没回来用户就切集"的竞态）
+//           有 mode-unsupported → 2（没有支持 HDR 的显示器）
 //           有 state.on        → 0（HDR 已开）
 //           否则              → 1（HDR 已关）
 //   on      有 mode-slow-on 时先睡 1.5 秒（用来构造"命令还在途时切集/停止"的竞态）
 //           有 mode-fail      → 3（模拟切换失败）
 //           否则写 state.on 并返回 0
-//   off     有 mode-off-fail  → 1，且不删 state.on（模拟"关不掉"）
+//   off     有 mode-slow-off 时先睡 1.5 秒（构造"关闭还没落地新片就开播"的竞态）
+//           有 mode-off-fail  → 1，且不删 state.on（模拟"关不掉"）
 //           否则删 state.on 并返回 0
 //
 // 每次调用都往 calls.log 追加一行 [子命令]，便于断言调用序列。
@@ -34,6 +36,7 @@ internal static class StubHdrCmd
 
         if (cmd == "status")
         {
+            if (Has("mode-slow-status")) Thread.Sleep(1500);
             if (Has("mode-unsupported")) return 2;
             return Has("state.on") ? 0 : 1;
         }
@@ -46,6 +49,7 @@ internal static class StubHdrCmd
         }
         if (cmd == "off")
         {
+            if (Has("mode-slow-off")) Thread.Sleep(1500);
             if (Has("mode-off-fail")) return 1;
             if (Has("state.on")) File.Delete(P("state.on"));
             return 0;

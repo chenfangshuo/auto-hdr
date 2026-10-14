@@ -296,6 +296,8 @@ local function turn_off_hdr(label, sync)
     info("%s：关闭系统 HDR", label)
     mp.osd_message("HDR: 自动恢复 SDR", 3)
 
+    local gen = generation   -- 发起时的代次：异步回调回来时用它判断是否已经有新文件
+
     if sync then
         -- 退出路径必须同步阻塞，否则播放器进程销毁后命令送不到
         local res = mp.command_native({
@@ -328,6 +330,13 @@ local function turn_off_hdr(label, sync)
         else
             err("关闭 HDR 未成功（status=%s），保留状态标记以便重试", tostring(status))
         end
+
+        -- 关闭期间恰好有文件开始播：它可能已经按"系统还是 HDR"做过判断
+        -- （缓存命中 → 无缝衔接，于是什么也没做）。现在 HDR 真的被关了，
+        -- 得让它按当前状态重跑一次，否则 HDR 片会在 SDR 下播。
+        if gen ~= generation and status == 0 then
+            restage_current_file()
+        end
     end)
 end
 
@@ -350,14 +359,27 @@ end
 -- 依据系统真实状态决定是否需要切换
 local function do_hdr_switch(is_movie_hdr, trigger_reason)
     -- 快路径：SDR 内容且系统 HDR 不是本脚本开的 → 无论真实状态如何都无事可做，
-    -- 直接放行，省掉一次 PowerShell 查询
+    -- 直接放行，省掉一次查询
     if not is_movie_hdr and not script_turned_on then
         log("SDR 内容且系统 HDR 非本脚本开启，无需处理（%s）", trigger_reason)
         release_pause()
         return
     end
 
+    -- 记下**决策时**的代次。不能只在下面 do_switch_command 里记：
+    -- 查询 HDRCmd 的这几十毫秒里用户可能已经切集，那时命令是在新代次下发出的，
+    -- 光比对命令回调的代次就发现不了"拿上一部影片的结论去切新影片"。
+    local gen = generation
+
     query_hdr_state(function(sys_hdr)
+        -- 查询期间用户切集或停止播放了：这份结论属于上一部影片，直接丢弃。
+        -- 这里连暂停都不要碰（新文件可能正处在自己的握手里），也不用收尾：
+        -- 切集时新文件自己的事件流会重新判定；停止播放时这条路径还没下发过任何命令。
+        if gen ~= generation then
+            log("状态查询回调时文件已变化，丢弃这次判定（%s）", trigger_reason)
+            return
+        end
+
         if sys_hdr == nil then
             -- 不支持 HDR 或查询失败：不做任何停顿与调用
             log("系统 HDR 状态不可用，跳过本次切换（%s）", trigger_reason)
@@ -512,7 +534,7 @@ mp.register_event("playback-restart", start_checking)
 -- 上一部影片的结论不能拿来收尾，改为按当前状态重新判定一次。
 -- 定义在这里是因为它要用到 start_checking（前置声明在文件上方）。
 restage_current_file = function()
-    log("切换命令回调时文件已变化（切集或已停止），改为按当前状态收尾")
+    log("异步回调返回时文件已变化（切集或已停止），改为按当前状态收尾")
 
     if mp.get_property("path", "") == "" then
         -- 只是停止播放、没有新文件：此时 settle() 刚把 script_turned_on 置为 true，

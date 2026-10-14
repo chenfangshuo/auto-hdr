@@ -15,9 +15,10 @@
 ```
 
 **原理**：`test\stub-hdrcmd.cs` 顶替真实的 `HDRCmd.exe` —— 它用 `state.on` 文件模拟"HDR 开着"，
-把每次调用追加到 `calls.log`，还能用 `mode-fail` / `mode-unsupported` / `mode-off-fail` / `mode-slow-on`
-标记文件模拟异常与"命令很慢"。脚本再把 `auto-hdr.lua` 复制一份补丁成：指向 stub、开 `debug`、
-握手缩到 0.3 秒，然后用 mpv 真跑一遍事件流，最后断言脚本日志与 HDRCmd 的调用序列。
+把每次调用追加到 `calls.log`，还能用 `mode-fail` / `mode-unsupported` / `mode-off-fail` /
+`mode-slow-on` / `mode-slow-status` / `mode-slow-off` 标记文件模拟异常与"命令/查询很慢"。
+脚本再把 `auto-hdr.lua` 复制一份补丁成：指向 stub、开 `debug`、握手缩到 0.3 秒，
+然后用 mpv 真跑一遍事件流，最后断言脚本日志与 HDRCmd 的调用序列。
 
 替身需要**运行时编译成 exe**（`run-tests.ps1` 用 `%WINDIR%\Microsoft.NET\Framework64\v4.0.30319\csc.exe`，
 没有就退回 `Add-Type`）。原因是脚本现在直接调用 `HDRCmd.exe`，而 Windows 的 `CreateProcess`
@@ -44,7 +45,9 @@
 | 播放中退出（✕ / `q`） | 立即同步关闭 |
 | `off` 失败（stub 返回非 0） | 退出时**不谎报关闭**，保留标记留给 `shutdown` 重试（两次 off） |
 | 停止播放打断在途的 `on` | 回调过期 → 按当前状态收尾，空闲时不留 HDR |
-| 在途 `on` 时切到 SDR | 旧结论**不套用**到新文件：日志应出现「HDR 已关闭（元数据）」 |
+| 命令在途时切到 SDR | 旧结论**不套用**到新文件：日志应出现「HDR 已关闭（元数据）」 |
+| **状态查询**在途时切到 SDR | 判定直接丢弃（`状态查询回调时文件已变化`），SDR 片不会被点亮 HDR |
+| 防抖关闭在途时打开新 HDR 片 | 关闭落地后补一次判断：HDR 片不会在 SDR 下播（日志出现 `异步回调返回时文件已变化` 与 `HDR 已开启`） |
 | `--pause` 启动 | 脚本**不解除**用户自己的暂停 |
 
 全部通过时退出码为 0，有失败项则为失败数量，方便接到别的地方跑。
