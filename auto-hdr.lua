@@ -19,8 +19,9 @@ local options = {
 
     -- 防漏帧延迟：显示器切换 HDR/SDR 时的黑屏物理握手时间（秒）。
     -- 开 HDR 的黑屏通常比关更长，故分开配置，可根据自己屏幕的表现微调。
-    handshake_delay_on = 3.8,
-    handshake_delay_off = 3.8,
+    -- 3.9 是本机实测值（3.8 会漏掉开头几帧）；换显示器要重新调，见 DEVELOPER.md 第 5 节。
+    handshake_delay_on = 3.9,
+    handshake_delay_off = 3.9,
 
     -- 延迟关闭时间：播放结束后延迟关闭 HDR 的缓冲（秒）。
     -- 为切集、选片提供防抖，避免关了又开。
@@ -46,6 +47,8 @@ local unpause_timer = nil        -- "握手完成后解除暂停"的定时器
 local check_timer = nil          -- 元数据轮询定时器
 local turn_off_timer = nil       -- 播放结束后的关机倒计时
 local current_playing_path = ""  -- 当前视频路径，用于避免 seek/重载时重复触发检测
+local generation = 0             -- 每次开始加载新文件 / 文件被卸载都 +1，用于丢弃上一部影片遗留的异步回调
+local restage_current_file       -- 前置声明（定义在事件区）：切换回调过期时按当前状态重新收尾
 
 -- 系统 HDR 状态缓存：cached_state 为 true/false；nil 表示"不支持 HDR 或查询失败"
 local cached_state = nil
@@ -71,30 +74,27 @@ end
 
 -- ==================== HDRCmd 调用层 ====================
 
--- PowerShell 单引号字符串转义：' -> ''
-local function ps_quote(s)
-    return "'" .. tostring(s):gsub("'", "''") .. "'"
-end
-
-local function hdrcmd_args(extra, pass_exit_code)
-    local cmd = "& " .. ps_quote(options.hdr_cmd_path)
+-- 直接调用 HDRCmd.exe，不经 PowerShell：
+--   * mpv 的 subprocess 在 Windows 上就是 CreateProcessW，拿到的是**真实退出码**，
+--     不再需要 `exit $LASTEXITCODE` 那种透传技巧（0=开 / 1=关 / 2=不支持 原样可读）；
+--   * 少一次 PowerShell 冷启动（实测约 0.7s/次，而每次切换要调两次）；
+--   * 路径写错时 mpv 直接给出 error_string == "init"，
+--     而不是像经 PowerShell 包装那样"进程起来了、退出码却是 0"被误读成"HDR 已开启"；
+--   * 路径里的空格与引号不用自己转义。
+local function hdrcmd_args(extra)
+    local args = {options.hdr_cmd_path}
     for _, arg in ipairs(extra) do
-        cmd = cmd .. " " .. arg
+        args[#args + 1] = arg
     end
-    if pass_exit_code then
-        -- powershell -Command 会把任何非 0 退出码压成 1，必须显式透传，
-        -- 否则 status 的 2（没有支持 HDR 的显示器）会被误读成 1（HDR 已关闭）
-        cmd = cmd .. "; exit $LASTEXITCODE"
-    end
-    return {"powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", cmd}
+    return args
 end
 
 -- 统一的外部调用：始终 capture + playback_only=false，
 -- 避免"当前播放项一结束就被 mpv 杀掉子进程"导致命令实际没执行。
-local function run_hdrcmd(extra, callback, pass_exit_code)
+local function run_hdrcmd(extra, callback)
     local args = {
         name = "subprocess",
-        args = hdrcmd_args(extra, pass_exit_code),
+        args = hdrcmd_args(extra),
         capture_stdout = true,
         capture_stderr = true,
         playback_only = false
@@ -106,7 +106,7 @@ local function run_hdrcmd(extra, callback, pass_exit_code)
     end
 end
 
--- 是否真的执行成功（进程起不来时 mpv 不抛错，只在结果里体现）
+-- 是否真的执行成功（进程起不来时 mpv 不抛错，只在结果里体现：error_string == "init"）
 local function hdrcmd_alive(success, result)
     return success and type(result) == "table"
         and result.error_string ~= "init"
@@ -162,12 +162,15 @@ local function query_hdr_state(callback)
         for _, cb in ipairs(waiters) do
             cb(state)
         end
-    end, true)   -- true：透传退出码，才能区分 1(关) 与 2(不支持)
+    end)
 end
 
 -- ==================== 暂停的所有权管理 ====================
 
 local function hold_pause()
+    -- 已经是暂停状态（`--pause` 启动、用户在检测期间自己按的暂停）就不要接管：
+    -- 一旦接管，后面的 release_pause* 会把用户的暂停顶掉
+    if mp.get_property_bool("pause") then return end
     paused_by_script = true
     mp.set_property_bool("pause", true)
 end
@@ -225,6 +228,7 @@ end
 local function do_switch_command(turn_on, trigger_reason)
     local delay = turn_on and options.handshake_delay_on or options.handshake_delay_off
     local action = turn_on and "on" or "off"
+    local gen = generation   -- 发起时的代次：回调回来时用它判断文件是否已经变了
 
     hold_pause()
     rewind_if_needed()
@@ -259,19 +263,31 @@ local function do_switch_command(turn_on, trigger_reason)
             end
         end
 
+        -- 命令发出到回调之间，用户可能已经切集或停止播放：这份结论属于上一部影片，
+        -- 不能拿它给新文件排"握手后解除暂停"，也不能把 HDR 晾在空闲状态上。
+        local function finish()
+            if gen ~= generation or mp.get_property("path", "") == "" then
+                restage_current_file()
+            else
+                release_pause_after(delay)
+            end
+        end
+
         if code == 0 then
             -- 退出码 0 表示结果与请求一致，直接采信并刷新缓存
             cached_state = turn_on
             cached_state_valid = true
             cached_state_time = mp.get_time()
             settle(turn_on)
+            finish()
         else
             -- 退出码异常：以回读到的真实状态为准，避免"假成功"污染内部状态
             cached_state_valid = false
-            query_hdr_state(settle)
+            query_hdr_state(function(state)
+                settle(state)
+                finish()
+            end)
         end
-
-        release_pause_after(delay)
     end)
 end
 
@@ -287,26 +303,30 @@ local function turn_off_hdr(label, sync)
             playback_only = false,
             args = hdrcmd_args({"off"})
         })
-        -- 进程起不来时 mpv 不抛错，只在结果里体现；此时保留标记以便 shutdown 再试一次
-        if res and res.error_string ~= "init" and res.killed_by_us ~= true then
+        -- 进程起不来时 mpv 不抛错，只在结果里体现；退出码 0 才代表 HDRCmd 真的关了
+        -- （1 = 结果与请求不符，-1 = API 失败）。没关成功就保留标记，
+        -- 随后触发的 shutdown 还会再试一次。
+        if res and res.error_string ~= "init" and res.killed_by_us ~= true and res.status == 0 then
             script_turned_on = false
             cached_state = false
             cached_state_valid = true
             cached_state_time = mp.get_time()
         else
-            err("退出时关闭 HDR 未成功")
+            err("退出时关闭 HDR 未成功（status=%s），保留状态标记以便重试",
+                tostring(res and res.status))
         end
         return
     end
 
     run_hdrcmd({"off"}, function(success, result)
-        if hdrcmd_alive(success, result) then
+        local status = hdrcmd_alive(success, result) and result.status or nil
+        if status == 0 then
             script_turned_on = false
             cached_state = false
             cached_state_valid = true
             cached_state_time = mp.get_time()
         else
-            err("关闭 HDR 未成功，保留状态标记以便重试")
+            err("关闭 HDR 未成功（status=%s），保留状态标记以便重试", tostring(status))
         end
     end)
 end
@@ -370,15 +390,18 @@ local function do_hdr_switch(is_movie_hdr, trigger_reason)
 end
 
 -- 识别文件名中的常见 HDR / 杜比视界标签
+-- 标签必须落在词边界上：`HDRip`（HD Rip，纯 SDR 片源）里也有 "hdr" 子串，
+-- 无边界的 string.find(name, "hdr") 会把这类资源一律预判成 HDR 并挡掉元数据纠正。
 local function is_hdr_filename(name)
     if not name or name == "" then return false end
-    local lower = string.lower(name)
-    if string.find(lower, "hdr")
-       or string.find(lower, "dovi")
-       or string.find(lower, "dolby[%s%.%-_]?vision")
-       or string.find(lower, "[%s%.%-_]dv[%s%.%-_]")
-       or string.find(lower, "smpte2084")
-       or string.find(lower, "hlg") then
+    -- 两端补 "."，让位于开头/结尾的标签也能吃到边界
+    local s = "." .. string.lower(name) .. "."
+    if s:find("[^a-z]hdr[^a-z]")            -- hdr / hdr10 / hdr10+，排除 hdrip
+       or s:find("dovi")
+       or s:find("dolby[%s%.%-_]?vision")
+       or s:find("[%s%.%-_]dv[%s%.%-_]")
+       or s:find("smpte2084")
+       or s:find("[^a-z]hlg[^a-z]") then    -- 同上，排除 hlgs 之类
         return true
     end
     return false
@@ -414,6 +437,7 @@ end
 
 -- 新文件开始加载：立刻取消上一集遗留的关机倒计时与解除暂停
 mp.register_event("start-file", function()
+    generation = generation + 1
     cancel_turn_off_timer()
     drop_pending_unpause()
 end)
@@ -484,9 +508,28 @@ end
 
 mp.register_event("playback-restart", start_checking)
 
+-- 切换命令的回调回来时文件已经换了（切集）或已经不在了（停止播放）：
+-- 上一部影片的结论不能拿来收尾，改为按当前状态重新判定一次。
+-- 定义在这里是因为它要用到 start_checking（前置声明在文件上方）。
+restage_current_file = function()
+    log("切换命令回调时文件已变化（切集或已停止），改为按当前状态收尾")
+
+    if mp.get_property("path", "") == "" then
+        -- 只是停止播放、没有新文件：此时 settle() 刚把 script_turned_on 置为 true，
+        -- 正好由防抖关闭接管，否则空闲状态下 HDR 会一直亮着
+        schedule_turn_off("播放结束且无新视频")
+        return
+    end
+
+    current_playing_path = ""   -- 清掉去重标记，让 start_checking 对新文件重跑一遍
+    start_checking()
+end
+
 -- 播放结束/切集/退出
 mp.register_event("end-file", function(e)
     current_playing_path = ""
+    -- 代次 +1，让在途的旧回调失效：停止播放（文件被卸载）时不会有 start-file 来触发这件事
+    generation = generation + 1
     if check_timer then check_timer:kill(); check_timer = nil end
 
     if not script_turned_on then return end

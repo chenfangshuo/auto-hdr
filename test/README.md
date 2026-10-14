@@ -14,10 +14,14 @@
 .\test\run-tests.ps1 -MpvPath "D:\mpv\mpv.com" -KeepTemp
 ```
 
-**原理**：`test\stub-hdrcmd.bat` 顶替真实的 `HDRCmd.exe` —— 它用 `state.on` 文件模拟"HDR 开着"，
-把每次调用追加到 `calls.log`，还能用 `mode-fail` / `mode-unsupported` 两个标记文件模拟异常。
-脚本再把 `auto-hdr.lua` 复制一份补丁成：指向 stub、开 `debug`、握手缩到 0.3 秒，
-然后用 mpv 真跑一遍事件流，最后断言脚本日志与 HDRCmd 的调用序列。
+**原理**：`test\stub-hdrcmd.cs` 顶替真实的 `HDRCmd.exe` —— 它用 `state.on` 文件模拟"HDR 开着"，
+把每次调用追加到 `calls.log`，还能用 `mode-fail` / `mode-unsupported` / `mode-off-fail` / `mode-slow-on`
+标记文件模拟异常与"命令很慢"。脚本再把 `auto-hdr.lua` 复制一份补丁成：指向 stub、开 `debug`、
+握手缩到 0.3 秒，然后用 mpv 真跑一遍事件流，最后断言脚本日志与 HDRCmd 的调用序列。
+
+替身需要**运行时编译成 exe**（`run-tests.ps1` 用 `%WINDIR%\Microsoft.NET\Framework64\v4.0.30319\csc.exe`，
+没有就退回 `Add-Type`）。原因是脚本现在直接调用 `HDRCmd.exe`，而 Windows 的 `CreateProcess`
+只认可执行映像，`.bat` 会直接失败（`error_string == "init"`）。仓库里只存 `.cs` 源码，不放二进制。
 
 脚本与 HDRCmd 之间的约定只有两条：**退出码**（0=开 / 1=关 / 2=不支持 / 非 0=失败）
 和 stdout 里的 `HDR is on|off|unsupported`，所以 stub 可以完整替代真身。
@@ -28,6 +32,8 @@
 | :-- | :-- |
 | HDR 文件名 → 预判开启 | 调用序列 `status,on`，且**不**进入元数据检测 |
 | DoVi 文件名 → 预判开启 | 同上（杜比视界标签） |
+| `HDRip` 文件名 | **不再**误判成 HDR（词边界生效），零外部调用 |
+| `hdr_cmd_path` 写错 | 报「系统 HDR 状态查询失败」并整体旁路，**不静默当成"HDR 已开"** |
 | 纯 SDR 视频（带真实 video-params） | 判定 `-> sdr`，且**零**外部调用（走快路径） |
 | 音轨文件 | 元数据 `wait` 到超时 → 文件名兜底判 SDR |
 | HDR → SDR 连播 | 调用恰好 `status,on,status,off`：中间不夹多余的一次关 |
@@ -36,6 +42,10 @@
 | 播到结尾（`keep-open` 停在最后一帧） | **保持 HDR 不关**，方便拖进度条回看；退出时才关 |
 | 手动 `stop`（文件被卸载） | 2.5s 防抖倒计时后关闭 |
 | 播放中退出（✕ / `q`） | 立即同步关闭 |
+| `off` 失败（stub 返回非 0） | 退出时**不谎报关闭**，保留标记留给 `shutdown` 重试（两次 off） |
+| 停止播放打断在途的 `on` | 回调过期 → 按当前状态收尾，空闲时不留 HDR |
+| 在途 `on` 时切到 SDR | 旧结论**不套用**到新文件：日志应出现「HDR 已关闭（元数据）」 |
+| `--pause` 启动 | 脚本**不解除**用户自己的暂停 |
 
 全部通过时退出码为 0，有失败项则为失败数量，方便接到别的地方跑。
 
@@ -57,7 +67,11 @@
    拖回去继续播也不该触发重新判定。此时关闭 mpv 才恢复 SDR。
 6. **手动对抗**：播放中用 Win+Alt+B 自己开关 HDR，再切集 —— 脚本应以真实状态为准；
    片尾不要关掉你**手动**开的 HDR。
-7. **退出**：播放中点 ✕ 或按 `q`，立即恢复 SDR；任务管理器里不应残留 `HDRCmd.exe` / `powershell.exe`。
+7. **退出**：播放中点 ✕ 或按 `q`，立即恢复 SDR；任务管理器里不应残留 `HDRCmd.exe`。
 8. **拖动进度条 / 暂停继续**：日志里不应出现新的判定（路径去重生效）。
+9. **切断依赖时的表现**：把 `options.hdr_cmd_path` 临时改成一个不存在的路径，打开 HDR 片 ——
+   应看到 OSD「HDR: 无法获取系统 HDR 状态，已跳过」+ 日志「系统 HDR 状态查询失败」，
+   画面正常播放（只是不切 HDR）。确认后把路径改回来。
+10. **`--pause` 启动**：`mpv --pause 某HDR片.mkv` 应在切换完成后**保持暂停**，等你按空格。
 
 排错时把 `options.debug` 设为 `true`，看 `[auto_hdr]` 日志（字段含义见 [../DEVELOPER.md](../DEVELOPER.md) 第 6 节）。

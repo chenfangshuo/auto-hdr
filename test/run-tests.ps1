@@ -1,14 +1,17 @@
 <#
     auto-hdr.lua 逻辑自测
 
-    用假的 HDRCmd（stub .bat）驱动真实的 mpv 事件流，全程不碰真实显示器，
-    可以随时反复运行。覆盖：文件名预判、元数据判定、快路径、防抖、状态复核、
-    命令失败、无 HDR 显示器、片尾关闭、退出关闭。
+    用假的 HDRCmd（运行时编译出的 stub.exe）驱动真实的 mpv 事件流，全程不碰真实显示器，
+    可以随时反复运行。覆盖：文件名预判、元数据判定、快路径、防抖、状态复核、命令失败、
+    无 HDR 显示器、片尾关闭、退出关闭、路径写错、停止播放/切集的回调竞态、暂停所有权。
 
     用法：
-        powershell -ExecutionPolicy Bypass -File test\run-tests.ps1
-        powershell -ExecutionPolicy Bypass -File test\run-tests.ps1 -MpvPath "D:\mpv\mpv.com"
-        powershell -ExecutionPolicy Bypass -File test\run-tests.ps1 -KeepTemp   # 保留现场便于排查
+        powershell -File test\run-tests.ps1
+        powershell -File test\run-tests.ps1 -MpvPath "D:\mpv\mpv.com"
+        powershell -File test\run-tests.ps1 -KeepTemp   # 保留现场便于排查
+
+    替身为什么是编译出来的 exe：脚本直接调用 HDRCmd.exe（mpv 用 CreateProcessW 拉起），
+    而 CreateProcess 只认可执行映像，.bat 会直接失败。见 stub-hdrcmd.cs 的说明。
 
     真实 HDR 切换的手工清单见 test\README.md。
 #>
@@ -31,20 +34,43 @@ New-Item -ItemType Directory -Path $work | Out-Null
 
 $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 
-# ---------- 1. 假 HDRCmd：记录调用 + 维护状态 + 可切换失败模式 ----------
-$stubPath    = Join-Path $work "hdr-cmd.bat"
+# ---------- 1. 假 HDRCmd：编译成 exe + 可切换的失败模式 ----------
+$stubExe     = Join-Path $work "hdr-cmd.exe"
 $callsPath   = Join-Path $work "calls.log"
 $statePath   = Join-Path $work "state.on"
 $modeFail    = Join-Path $work "mode-fail"
 $modeNoHdr   = Join-Path $work "mode-unsupported"
+$modeOffFail = Join-Path $work "mode-off-fail"
+$modeSlowOn  = Join-Path $work "mode-slow-on"
 
-$stubSource = Join-Path $PSScriptRoot "stub-hdrcmd.bat"
+$stubSource = Join-Path $PSScriptRoot "stub-hdrcmd.cs"
 if (-not (Test-Path $stubSource)) { throw "找不到 $stubSource" }
-Copy-Item $stubSource $stubPath -Force
+$stubCode = [System.IO.File]::ReadAllText($stubSource, [System.Text.Encoding]::UTF8)
 
-# ---------- 2. 退出助手：N 秒后退出，模拟用户按 q / 点 ✕ ----------
-$quitHelper = Join-Path $work "testquit.lua"
-$stopHelper = Join-Path $work "teststop.lua"
+function New-StubExe([string]$Output) {
+    # 首选 .NET Framework 自带的 C# 编译器（Win10/11 默认存在，输出的是真 exe）
+    $csc = Join-Path $env:WINDIR "Microsoft.NET\Framework64\v4.0.30319\csc.exe"
+    if (Test-Path $csc) {
+        $csFile = [System.IO.Path]::ChangeExtension($Output, ".cs")
+        [System.IO.File]::WriteAllText($csFile, $stubCode, $utf8NoBom)
+        & $csc /nologo /target:exe "/out:$Output" $csFile | Out-Null
+        if (Test-Path $Output) { return }
+        Write-Host "csc.exe 编译失败，改用 Add-Type" -ForegroundColor DarkYellow
+    }
+    # 回退：Add-Type（Windows PowerShell 5.1 支持 -OutputType ConsoleApplication）
+    try {
+        Add-Type -TypeDefinition $stubCode -OutputAssembly $Output -OutputType ConsoleApplication -ErrorAction Stop
+    } catch {
+        throw "无法生成测试替身（csc.exe 与 Add-Type 都不可用）：$($_.Exception.Message)"
+    }
+}
+New-StubExe $stubExe
+
+# ---------- 2. 助手脚本：定时退出 / 停止 / 切集 / 打印暂停状态 ----------
+$quitHelper  = Join-Path $work "testquit.lua"
+$stopHelper  = Join-Path $work "teststop.lua"
+$nextHelper  = Join-Path $work "testnext.lua"
+$probeHelper = Join-Path $work "testprobe.lua"
 function Write-QuitHelper([int]$Seconds) {
     $lua = "mp.add_timeout($Seconds, function() mp.command(`"quit`") end)`r`n"
     [System.IO.File]::WriteAllText($quitHelper, $lua, $utf8NoBom)
@@ -53,16 +79,41 @@ function Write-StopHelper([int]$Seconds) {
     $lua = "mp.add_timeout($Seconds, function() mp.command(`"stop`") end)`r`n"
     [System.IO.File]::WriteAllText($stopHelper, $lua, $utf8NoBom)
 }
+function Write-NextHelper([double]$Seconds) {
+    $lua = "mp.add_timeout($Seconds, function() mp.command(`"playlist-next`") end)`r`n"
+    [System.IO.File]::WriteAllText($nextHelper, $lua, $utf8NoBom)
+}
+function Write-ProbeHelper([double]$Seconds) {
+    $lua = "mp.add_timeout($Seconds, function() mp.msg.info(`"TESTPROBE pause=`" .. tostring(mp.get_property_bool(`"pause`"))) end)`r`n"
+    [System.IO.File]::WriteAllText($probeHelper, $lua, $utf8NoBom)
+}
 
 # ---------- 3. 测试用的 auto-hdr.lua 副本（指向 stub、缩短握手、开 debug）----------
-$testScript = Join-Path $work "auto-hdr.lua"
+# 注意：脚本现在是直连 exe，路径写进 Lua 字符串里必须双反斜杠
+$stubLuaPath = $stubExe -replace '\\', '\\\\'
+$testScript  = Join-Path $work "auto-hdr.lua"
 $src = [System.IO.File]::ReadAllText($scriptSrc, [System.Text.Encoding]::UTF8)
-$patched = $src.Replace('hdr_cmd_path = "C:\\Program Files\\mpv\\HDRCmd.exe"', 'hdr_cmd_path = "' + ($stubPath -replace '\\','/') + '"')
+$patched = $src.Replace('hdr_cmd_path = "C:\\Program Files\\mpv\\HDRCmd.exe"', 'hdr_cmd_path = "' + $stubLuaPath + '"')
 $patched = $patched.Replace('debug = false', 'debug = true')
-$patched = $patched.Replace('handshake_delay_on = 3.8', 'handshake_delay_on = 0.3')
-$patched = $patched.Replace('handshake_delay_off = 3.8', 'handshake_delay_off = 0.3')
+# 握手值用正则改，别按字面量替换：默认值一调整，字面量匹配就会静默失效，
+# 测试里每次切换会真的等 3.9 秒（拖慢，而且会打乱靠时间点构造的用例 14/15）
+$patched = $patched -replace 'handshake_delay_(on|off) = [0-9.]+', 'handshake_delay_$1 = 0.3'
 if ($patched -eq $src) { throw "补丁没生效：请检查脚本里的 options 默认值是否被改动过" }
+if ($patched -notmatch 'handshake_delay_on = 0\.3' -or $patched -notmatch 'debug = true') {
+    throw "补丁没打全：握手值或 debug 没换掉，测试会变慢/看不到日志"
+}
 [System.IO.File]::WriteAllText($testScript, $patched, $utf8NoBom)
+
+# 同一份脚本、但 hdr_cmd_path 指向不存在的文件：验证"查不到状态就旁路"
+# 注意两点：用正斜杠（Lua 字符串里 "\n" 是换行、"\H" 是非法转义，写反斜杠会把脚本写坏）；
+# 副本要放在独立目录里并保持 auto-hdr.lua 这个文件名 —— mpv 用**文件名**给日志加前缀，
+# 换个文件名日志就变成 [auto_hdr_badpath]，本脚本的日志过滤会漏掉。
+$badDir = Join-Path $work "badpath"
+New-Item -ItemType Directory -Path $badDir | Out-Null
+$testScriptBad = Join-Path $badDir "auto-hdr.lua"
+$bad = $patched.Replace('hdr_cmd_path = "' + $stubLuaPath + '"', 'hdr_cmd_path = "C:/no-such-dir/HDRCmd.exe"')
+if ($bad -eq $patched) { throw "坏路径补丁没生效" }
+[System.IO.File]::WriteAllText($testScriptBad, $bad, $utf8NoBom)
 
 # ---------- 4. 测试媒体 ----------
 function New-SilentWav([string]$Path, [int]$Seconds) {
@@ -77,42 +128,58 @@ function New-SilentWav([string]$Path, [int]$Seconds) {
     $bw.Write((New-Object byte[] $dataLen))
     $bw.Close(); $fs.Close()
 }
-New-SilentWav (Join-Path $work "movie.HDR.wav") 3
-New-SilentWav (Join-Path $work "ep2.DoVi.wav")  3
-New-SilentWav (Join-Path $work "plain.wav")     3
-New-SilentWav (Join-Path $work "long.HDR.wav")  30
+New-SilentWav (Join-Path $work "movie.HDR.wav")  3
+New-SilentWav (Join-Path $work "ep2.DoVi.wav")   3
+New-SilentWav (Join-Path $work "plain.wav")      3
+New-SilentWav (Join-Path $work "long.HDR.wav")   30
+New-SilentWav (Join-Path $work "movie.HDRip.wav") 3
 
-# 一段真实视频（音频文件没有 video-params，测不到元数据判定）
-$testVideo = "av://lavfi:testsrc=size=64x64:rate=5:duration=2"
+# 真实视频（音频文件没有 video-params，测不到元数据判定）
+$testVideo     = "av://lavfi:testsrc=size=64x64:rate=5:duration=2"
+$testLongVideo = "av://lavfi:testsrc=size=64x64:rate=5:duration=30"
 
 # ---------- 工具函数 ----------
 function Reset-Stub {
-    Remove-Item $callsPath, $statePath, $modeFail, $modeNoHdr -Force -ErrorAction SilentlyContinue
+    Remove-Item $callsPath, $statePath, $modeFail, $modeNoHdr, $modeOffFail, $modeSlowOn `
+        -Force -ErrorAction SilentlyContinue
 }
 function Set-StubMode([string]$Mode) {
-    if ($Mode -eq "fail")        { New-Item -ItemType File -Path $modeFail  | Out-Null }
-    if ($Mode -eq "unsupported") { New-Item -ItemType File -Path $modeNoHdr | Out-Null }
+    if ($Mode -eq "fail")        { New-Item -ItemType File -Path $modeFail    | Out-Null }
+    if ($Mode -eq "unsupported") { New-Item -ItemType File -Path $modeNoHdr   | Out-Null }
+    if ($Mode -eq "offfail")     { New-Item -ItemType File -Path $modeOffFail | Out-Null }
+    if ($Mode -eq "slowon")      { New-Item -ItemType File -Path $modeSlowOn  | Out-Null }
 }
 function Get-Calls {
     if (-not (Test-Path $callsPath)) { return @() }
     return @(Get-Content $callsPath | ForEach-Object { $_.Trim().Trim('[', ']') } |
              Where-Object { $_ -ne "" })
 }
-function Invoke-Mpv([string[]]$Files, [int]$QuitAfter, [string[]]$Extra, [int]$StopAfter = 0) {
+function Invoke-Mpv {
+    param(
+        [string[]]$Files = @(),
+        [int]$QuitAfter = 8,
+        [string[]]$Extra = @(),
+        [int]$StopAfter = 0,
+        [double]$NextAfter = 0,
+        [double]$ProbeAfter = 0,
+        [string]$ScriptPath = $testScript
+    )
     Write-QuitHelper $QuitAfter
     $outFile = Join-Path $work "mpv-out.txt"
     $errFile = Join-Path $work "mpv-err.txt"
     $helpers = @($quitHelper)
-    if ($StopAfter -gt 0) { Write-StopHelper $StopAfter; $helpers += $stopHelper }
+    if ($StopAfter -gt 0)  { Write-StopHelper $StopAfter;   $helpers += $stopHelper }
+    if ($NextAfter -gt 0)  { Write-NextHelper $NextAfter;   $helpers += $nextHelper }
+    if ($ProbeAfter -gt 0) { Write-ProbeHelper $ProbeAfter; $helpers += $probeHelper }
     $mpvArgs = @("--no-config", "--vo=null", "--ao=null", "--keep-open=yes",
-                 "--script=$testScript") + ($helpers | ForEach-Object { "--script=$_" }) + $Extra + $Files
+                 "--script=$ScriptPath") + ($helpers | ForEach-Object { "--script=$_" }) + $Extra + $Files
     $p = Start-Process -FilePath $MpvPath -ArgumentList $mpvArgs -NoNewWindow -PassThru `
                        -RedirectStandardOutput $outFile -RedirectStandardError $errFile
     if (-not $p.WaitForExit(30000)) { $p.Kill(); return @("[超时] mpv 未在 30 秒内退出") }
     $text = [System.IO.File]::ReadAllText($outFile, [System.Text.Encoding]::UTF8) + "`n" +
             [System.IO.File]::ReadAllText($errFile, [System.Text.Encoding]::UTF8)
-    return @($text -split "`r?`n" | Where-Object { $_ -match '^\[auto_hdr\]' } |
-             ForEach-Object { $_ -replace '^\[auto_hdr\]\s*', '' })
+    return @($text -split "`r?`n" | Where-Object { $_ -match '^\[(auto_hdr|testprobe)\]' } |
+             ForEach-Object { $_ -replace '^\[(auto_hdr|testprobe)\]\s*', '' })
 }
 
 $script:results = @()
@@ -125,9 +192,13 @@ function Test-Case {
         [string]$Name,
         [string[]]$Media = @(),
         [string]$Video = "",
+        [string[]]$List = @(),          # 显式指定播放列表顺序（元素含 "://" 时按 URL 处理）
         [string]$Mode = "ok",
         [int]$QuitAfter = 8,
         [int]$StopAfter = 0,
+        [double]$NextAfter = 0,
+        [double]$ProbeAfter = 0,
+        [switch]$BadPath,
         [string[]]$Extra = @(),
         [string[]]$Expect = @(),
         [string[]]$ExpectAbsent = @(),
@@ -137,10 +208,16 @@ function Test-Case {
     Reset-Stub
     Set-StubMode $Mode
     $files = @()
-    if ($Video) { $files += $Video }
-    $files += ($Media | ForEach-Object { Join-Path $work $_ })
+    if ($List.Count -gt 0) {
+        $files = $List | ForEach-Object { if ($_ -match "://") { $_ } else { Join-Path $work $_ } }
+    } else {
+        if ($Video) { $files += $Video }
+        $files += ($Media | ForEach-Object { Join-Path $work $_ })
+    }
 
-    $log = Invoke-Mpv -Files $files -QuitAfter $QuitAfter -Extra $Extra -StopAfter $StopAfter
+    $log = Invoke-Mpv -Files $files -QuitAfter $QuitAfter -Extra $Extra -StopAfter $StopAfter `
+                      -NextAfter $NextAfter -ProbeAfter $ProbeAfter `
+                      -ScriptPath $(if ($BadPath) { $testScriptBad } else { $testScript })
     $logText = ($log -join "`n")
     $calls = Get-Calls
     $callsText = ($calls -join ",")
@@ -154,7 +231,10 @@ function Test-Case {
     $detail = ""
     if ($problems.Count -gt 0) {
         $detail = ($problems -join "；") + "`n    实际调用：[$callsText]`n    日志尾部：" +
-                  (($log | Select-Object -Last 4 | ForEach-Object { "`n      $_" }) -join "")
+                  (($log | Select-Object -Last 6 | ForEach-Object { "`n      $_" }) -join "")
+        if ($log.Count -eq 0) {
+            $detail += "`n    （日志为空：脚本可能根本没被加载，加 -KeepTemp 后看 $work\mpv-err.txt）"
+        }
     } else {
         $detail = "调用 [$callsText]"
     }
@@ -171,6 +251,14 @@ Test-Case -Name "HDR 文件名 → 预判开启 HDR" -Media @("movie.HDR.wav") `
 Test-Case -Name "DoVi 文件名 → 预判开启 HDR" -Media @("ep2.DoVi.wav") `
     -Expect @("HDR 已开启（文件名预判") `
     -CallsMatch "^status,on"
+
+Test-Case -Name "HDRip（SDR 片源）→ 不再误判成 HDR" -Media @("movie.HDRip.wav") `
+    -Expect @("无需处理（元数据超时") -ExpectAbsent @("文件名预判") `
+    -CallsMatch "^$"
+
+Test-Case -Name "HDRCmd 路径写错 → 报错并旁路（不静默当成已开）" -Media @("movie.HDR.wav") -BadPath `
+    -Expect @("系统 HDR 状态查询失败", "跳过本次切换") -ExpectAbsent @("HDR 已开启", "无缝衔接") `
+    -CallsMatch "^$"
 
 Test-Case -Name "纯 SDR 视频 → 走快路径，零外部调用" -Video $testVideo `
     -Expect @("元数据检测：gamma=srgb", "-> sdr") `
@@ -205,6 +293,24 @@ Test-Case -Name "播放中退出(✕/q) → 立即同步关闭" -Media @("long.H
     -Expect @("mpv 退出：关闭系统 HDR") `
     -CallsMatch "^status,on,off$"
 
+Test-Case -Name "off 失败 → 退出时不谎报关闭，留给 shutdown 重试" -Media @("long.HDR.wav") -Mode "offfail" -QuitAfter 3 `
+    -Expect @("退出时关闭 HDR 未成功", "mpv 关闭：关闭系统 HDR") -ExpectAbsent @("HDR 已关闭") `
+    -CallsMatch "^status,on,off,off$"
+
+Test-Case -Name "停止播放打断在途的 on → 空闲不留 HDR" -Media @("long.HDR.wav") -Mode "slowon" `
+    -StopAfter 1 -QuitAfter 12 -Extra @("--idle=yes") `
+    -Expect @("回调时文件已变化", "播放结束且无新视频：关闭系统 HDR") `
+    -CallsMatch "^status,on,off$"
+
+Test-Case -Name "命令在途时切到 SDR → 旧结论不套用到新文件" -Mode "slowon" -NextAfter 0.6 `
+    -QuitAfter 10 -Extra @("--idle=yes") -List @("long.HDR.wav", $testLongVideo) `
+    -Expect @("回调时文件已变化", "HDR 已关闭（元数据") `
+    -CallsMatch "^status,on,off$"
+
+Test-Case -Name "--pause 启动 → 脚本不解除用户的暂停" -Media @("movie.HDR.wav") -QuitAfter 6 `
+    -Extra @("--pause") -ProbeAfter 5 `
+    -Expect @("TESTPROBE pause=true") -ExpectAbsent @("TESTPROBE pause=false")
+
 # ---------- 汇总 ----------
 Write-Host ""
 $pass = @($script:results | Where-Object Pass).Count
@@ -215,7 +321,7 @@ foreach ($r in $script:results) {
     $i++
     $tag = if ($r.Pass) { "PASS" } else { "FAIL" }
     $color = if ($r.Pass) { "Green" } else { "Red" }
-    Write-Host ("[{0}/{1}] {2,-46} {3}" -f $i, $script:results.Count, $r.Name, $tag) -ForegroundColor $color
+    Write-Host ("[{0}/{1}] {2,-52} {3}" -f $i, $script:results.Count, $r.Name, $tag) -ForegroundColor $color
     if (-not $r.Pass) { Write-Host ("        " + $r.Detail) -ForegroundColor Yellow }
     elseif ($r.Detail) { Write-Host ("        " + $r.Detail) -ForegroundColor DarkGray }
 }

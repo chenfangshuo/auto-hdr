@@ -42,10 +42,27 @@
 | 参数 | 默认 | 什么时候改 |
 | :--- | :--- | :--- |
 | `hdr_cmd_path` | `C:\\Program Files\\mpv\\HDRCmd.exe` | HDRCmd.exe 不在这个位置时。**Lua 里反斜杠必须写两个** |
-| `handshake_delay_on` | `3.8` 秒 | **开** HDR 时等显示器黑屏结束的时间。画面亮了才开始播 → 调大；黑屏早结束了还在等 → 调小 |
-| `handshake_delay_off` | `3.8` 秒 | **关** HDR 时的同一等待。开 HDR 的黑屏通常比关更长，所以两个值分开配 |
+| `handshake_delay_on` | `3.9` 秒 | **开** HDR 时等显示器黑屏结束的时间。画面亮了才开始播 → 调大；黑屏早结束了还在等 → 调小 |
+| `handshake_delay_off` | `3.9` 秒 | **关** HDR 时的同一等待。开 HDR 的黑屏通常比关更长，所以两个值分开配 |
 
 其余参数（判定逻辑、状态缓存、调试日志等）见 [DEVELOPER.md](DEVELOPER.md)。
+
+> 从旧版本升级上来的话，把这两个值各加 0.1~0.3 秒再试一遍：新版不再经 PowerShell 调用，
+> 同样的数值实际等的时间短了 1 秒多，**不然会漏掉片头几帧**。
+
+## 配套的 mpv 设置（可选）
+
+本脚本只管**系统层**的 HDR 开关，画面本身是不是 HDR 信号由 mpv 的视频输出决定。
+如果切到 HDR 后画面发灰、发白、颜色不对，多半是 mpv 还在按 SDR 输出：
+
+| 视频输出 | 相关选项 |
+| :--- | :--- |
+| `vo=gpu`（mpv 默认） | `d3d11-output-csp=pq` |
+| `vo=gpu-next` | `target-colorspace-hint=yes` |
+
+写进 `mpv.conf` 即可。两个选项在各个 mpv 版本里的默认值和取值不太一样，
+以自己那份手册为准（`mpv --list-options` 可以看到本机支持的值）。
+画面正常就不用改。
 
 ## 注意
 
