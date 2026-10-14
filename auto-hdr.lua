@@ -13,6 +13,14 @@
 ]]
 
 -- ==================== 用户配置区域 ====================
+-- English: the only values you normally edit.
+--   hdr_cmd_path        path to HDRCmd.exe (double the backslashes in Lua)
+--   handshake_delay_on/off  seconds to wait for your display's black-screen handshake when HDR is
+--                       switched on/off — too short misses the first frames, too long pauses longer
+--                       (3.9 is the measured value for this machine)
+--   turn_off_delay      debounce before switching back to SDR after playback ends
+--   debug               true prints log lines prefixed [auto_hdr] (see DEVELOPER.md §6)
+-- Details and the rest of this file are in Chinese: README.md / DEVELOPER.md.
 local options = {
     -- HDRCmd.exe 的绝对路径（注意：Lua 中需使用双反斜杠 \\）
     hdr_cmd_path = "C:\\Program Files\\mpv\\HDRCmd.exe",

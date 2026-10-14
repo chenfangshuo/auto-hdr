@@ -1,5 +1,19 @@
 # MPV Auto HDR Switcher for Windows
 
+**In short (English):** this mpv script turns Windows HDR **on** when you play an HDR video and back
+**off** when you switch to SDR content or quit mpv — no more Win+Alt+B. HDR stays on after a movie ends
+(so you can seek back and replay), and HDR you enabled yourself is never touched.
+The rest of this file, [DEVELOPER.md](DEVELOPER.md) and the source comments are in Chinese.
+
+* **Requires:** Windows 10/11, [mpv](https://mpv.io), and `HDRCmd.exe` from
+  [HDRTray releases](https://github.com/res2k/HDRTray/releases).
+* **Install:** (1) download `auto-hdr.lua` from [Releases](https://github.com/chenfangshuo/auto-hdr/releases/latest)
+  and put it in mpv's scripts folder — portable: `mpv\portable_config\scripts\`, installed: `%APPDATA%\mpv\scripts\`;
+  (2) put `HDRCmd.exe` at `C:\Program Files\mpv\HDRCmd.exe`, or point `hdr_cmd_path` at it in the script.
+* **Tuning:** `handshake_delay_on` / `handshake_delay_off` (seconds, default `3.9`) is how long the script
+  waits for your display's black-screen handshake when HDR is switched. Too short → the first frames of a
+  movie are missed; too long → a longer pause before playback starts.
+
 播放 HDR 影片时自动打开 Windows 的 HDR，播放 SDR 内容时自动切回 —— 不用再手动按 Win+Alt+B。
 
 ## 实际体验
