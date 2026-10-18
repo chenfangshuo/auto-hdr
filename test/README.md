@@ -1,6 +1,7 @@
 # 测试
 
-分两部分：**自动化逻辑自测**（用假 HDRCmd，不碰真实显示器，随时可跑）和**真机 HDR 验收清单**（只能人工看）。
+分三部分：**自动化逻辑自测**（用假 HDRCmd，不碰真实显示器，随时可跑）、
+**真机自动化**（会真的切换显示器，但不需要按播放器按钮）和**真机 HDR 验收清单**（人工看观感）。
 
 ---
 
@@ -68,7 +69,34 @@
 
 ---
 
-## 二、真机 HDR 验收清单
+## 二、真机自动化（会切换显示器）
+
+`test\real-machine.ps1` 把两个时序敏感的真机场景自动化：**用 mpv 的 IPC 命名管道代替按钮**
+发送 `stop` / `loadfile`，用 `HDRCmd status` 的退出码判断系统 HDR 的真实状态，
+再读 `[auto_hdr]` 日志确认走了哪条修复分支。不需要 uosc 的停止按钮。
+
+```powershell
+# 用 PowerShell 7（脚本是 UTF-8 无 BOM，Windows PowerShell 5.1 会把中文读坏）
+pwsh -File .\test\real-machine.ps1              # 自动在仓库的上一级目录找 DV/SDR 片源，跑 A + B
+pwsh -File .\test\real-machine.ps1 -Scenario A   # 只跑 A（不切系统 HDR）
+pwsh -File .\test\real-machine.ps1 -HdrFile "D:\x.DV.mkv" -SdrFile "D:\y.mp4"
+pwsh -File .\test\real-machine.ps1 -KeepTemp    # 保留日志与脚本副本
+```
+
+* **场景 A：状态查询在途时停止播放。** 为了在这台机器上稳定构造窗口，A 会把 `hdr_cmd_path`
+  指向一个运行时编译的薄包装：`status` 先睡 1.5 秒再调用**真实** HDRCmd（`on`/`off` 不受影响）。
+  断言：停播回到空闲后 `pause=false`，日志出现「状态查询回调时文件已变化」，且没有切换 HDR。
+* **场景 B：后台关闭的黑屏握手期间打开 SDR。** 播放 HDR 片（脚本开 HDR）→ `stop` →
+  等防抖关闭落地（显示器开始黑屏）→ 立刻 `loadfile` SDR 片。断言：新文件先被暂停
+  （不会在黑屏里开播），握手结束后恢复播放且 `time-pos` 正常推进。
+* B 会临时改变系统 HDR（必要时先关掉），结束时恢复测试前的状态；运行期间显示器会黑屏 1~2 次。
+* 两个场景都用 `--no-config --vo=null --ao=null`，不弹播放窗口、不依赖个人配置。
+
+> 场景 A 要求 HDR 片源文件名带 `HDR` / `DV` / `DoVi` 等标签（脚本才会走文件名预判路径）。
+
+---
+
+## 三、真机 HDR 验收清单
 
 会真的切换显示器，建议按顺序过一遍：
 

@@ -298,6 +298,16 @@ HDR 就保持开启 —— 这正是想要的：播完往往还要拖进度条�
 用例清单、断言重点与真机验收清单见 [test/README.md](test/README.md)。
 改完逻辑先跑它，比手动验证快得多。
 
+时序敏感的两项真机验收也自动化了（**会真的切换显示器**，需要本机有片源）：
+
+```powershell
+pwsh -File .\test\real-machine.ps1            # 场景 A + B
+pwsh -File .\test\real-machine.ps1 -Scenario A  # 只跑不切 HDR 的那条
+```
+
+它用 mpv 的 IPC 命名管道代替播放器按钮发 `stop`/`loadfile`，用 `HDRCmd status` 判定真实状态；
+细节与前置条件见 test/README.md 第二节。
+
 ---
 
 ## 9. 依赖的外部事实（核对来源）
