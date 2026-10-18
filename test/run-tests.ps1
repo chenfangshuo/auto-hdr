@@ -48,6 +48,7 @@ $modeSlowOff = Join-Path $work "mode-slow-off"
 $modeSlowExitOn = Join-Path $work "mode-slow-exit-on"
 $modeSlowExitSt = Join-Path $work "mode-slow-exit-status"
 $modeSlowReread = Join-Path $work "mode-slow-reread"
+$modeHangOn = Join-Path $work "mode-hang-on"
 $attemptPath = Join-Path $work "on-attempt"
 
 $stubSource = Join-Path $PSScriptRoot "stub-hdrcmd.cs"
@@ -163,7 +164,7 @@ $testLongVideo = "av://lavfi:testsrc=size=64x64:rate=5:duration=30"
 # ---------- 工具函数 ----------
 function Reset-Stub {
     Remove-Item $callsPath, $statePath, $attemptPath, $modeFail, $modeNoHdr, $modeOffFail, $modeSlowOn, `
-        $modeSlowSt, $modeSlowOff, $modeSlowExitOn, $modeSlowExitSt, $modeSlowReread `
+        $modeSlowSt, $modeSlowOff, $modeSlowExitOn, $modeSlowExitSt, $modeSlowReread, $modeHangOn `
         -Force -ErrorAction SilentlyContinue
 }
 function Set-StubMode([string]$Mode) {
@@ -178,6 +179,7 @@ function Set-StubMode([string]$Mode) {
     if ($modes -contains "slowexit")        { New-Item -ItemType File -Path $modeSlowExitOn | Out-Null }
     if ($modes -contains "slowexitstatus")  { New-Item -ItemType File -Path $modeSlowExitSt | Out-Null }
     if ($modes -contains "slowreread")      { New-Item -ItemType File -Path $modeSlowReread | Out-Null }
+    if ($modes -contains "hangon")          { New-Item -ItemType File -Path $modeHangOn | Out-Null }
 }
 function Get-Calls {
     if (-not (Test-Path $callsPath)) { return @() }
@@ -428,6 +430,21 @@ Test-Case -Name "on 失败回读期间退出 → 仍然补关" -Mode "fail,slowr
     -Media @("long.HDR.wav") `
     -Expect @("mpv 退出：关闭系统 HDR", "mpv 关闭：关闭系统 HDR") `
     -CallsMatch "^status,on,status,off,off$"
+
+# ---------- 第五轮：超时看门狗 / 握手期间提前保护 ----------
+
+# 首次切换、命令一直不返回：finish() 永远不会来，没人检查上限就会永久暂停。
+# 看门狗（下发后立即排的释放检查）必须在 10 秒宽限后按降级策略放行。
+Test-Case -Name "首次切换命令卡死 → 超时后恢复播放" -Mode "hangon" `
+    -Media @("long.HDR.wav") -ProbeAfter 12 -QuitAfter 13 `
+    -Expect @("切换命令超时未返回", "TESTPROBE pause=false") `
+    -ExpectAbsent @("TESTPROBE pause=true")
+
+# 无 HDR 标签的文件在握手期间载入：从加载那一刻就该暂停，而不是等元数据检测（1.5s）完
+Test-Case -Name "握手期间载入无标签文件 → 加载时就暂停" -SlowHandshake -Mode "slowoff" `
+    -StopAfter 1 -LoadAfter 5.4 -LoadFile (Join-Path $work "plain.wav") -ProbeAfter 5.9 `
+    -QuitAfter 10 -Extra @("--idle=yes") -Media @("long.HDR.wav") `
+    -Expect @("TESTPROBE pause=true") -ExpectAbsent @("TESTPROBE pause=false")
 
 # ---------- 汇总 ----------
 Write-Host ""

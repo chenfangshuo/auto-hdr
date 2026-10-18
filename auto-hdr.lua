@@ -71,6 +71,7 @@ local state_version = 0             -- 每次切换命令开始/进程结束都 
 local switch_inflight = 0           -- 未结算的切换命令数（进程在跑，或结果还在回读）
 local switch_cap_until = -math.huge -- 命令迟迟不返回时最多等到这里，避免画面永久暂停
 local SWITCH_WAIT_CAP = 10          -- 秒；超过这个宽限就不再等命令
+local switch_cap_warned = false     -- 超时降级只提示一次
 local pending_final_off = false     -- 退出时曾有在途 on：shutdown 里再补一次 off
 
 -- 系统 HDR 状态缓存：cached_state 为 true/false；nil 表示"不支持 HDR 或查询失败"
@@ -220,9 +221,17 @@ local function hold_pause()
 end
 
 -- 还有未结算的切换命令吗？
--- "结算"包括进程结束之后的失败回读：那次回读同样可能改变系统状态。
+-- "结算"包括进程结束之后的失败回读：回读完成前，这次切换的结果还不算数
+-- （回读本身不改 HDR，但它决定这次操作是成功、失败还是未知）。
+-- 超过 switch_cap_until 后不再等待：宁可放画面，也不能因为命令卡死把播放永久暂停。
 local function switch_waiting()
-    return switch_inflight > 0 and mp.get_time() < switch_cap_until
+    if switch_inflight <= 0 then return false end
+    if mp.get_time() < switch_cap_until then return true end
+    if not switch_cap_warned then
+        switch_cap_warned = true
+        err("切换命令超时未返回，按降级策略恢复播放（显示器可能稍后才切换）")
+    end
+    return false
 end
 
 -- 物理握手结束后归还暂停。
@@ -305,14 +314,20 @@ local function do_switch_command(turn_on, trigger_reason)
 
     -- 从下发这一刻起就延长握手截止时间：命令回调可能比旧的等待定时器晚到
     -- （冷启动、杀毒扫描等），只在回调里刷新会留下"旧定时器先到点把画面放了"的窗口。
-    handshake_until = mp.get_time() + delay
+    -- 用 max 而不是直接覆盖：开关延迟分开配置时，后一次较短的等待不应缩短
+    -- 前一次还没结束的黑屏；后一条命令失败时也不该顺手把前一次的有效等待抹掉。
+    handshake_until = math.max(handshake_until, mp.get_time() + delay)
 
     -- 新的切换世界：在这之前启动的状态查询，读数都不再可信（见 query_hdr_state）
     state_version = state_version + 1
     switch_inflight = switch_inflight + 1
+    switch_cap_warned = false
     switch_cap_until = math.max(switch_cap_until, mp.get_time() + delay + SWITCH_WAIT_CAP)
 
     hold_pause()
+    -- 看门狗：命令一直不返回时 finish() 永远不会来，必须从现在起就有定时器检查上限，
+    -- 否则首次切换会永久停在暂停上（release_pause_after 自己会按 switch_waiting 轮询）。
+    if paused_by_script then release_pause_after(0.2) end
     rewind_if_needed()
     mp.osd_message(turn_on and "HDR: 正在准备开启..." or "HDR: 正在切回 SDR...", 2)
 
@@ -332,9 +347,9 @@ local function do_switch_command(turn_on, trigger_reason)
         log("HDRCmd %s 结束：success=%s status=%s", action, tostring(success), tostring(code))
 
         local function settle(state)
-            -- 切换真的生效：以命令落地的时间为起点刷新物理握手截止时间
+            -- 切换真的生效：以命令落地的时间为起点刷新物理握手截止时间（只延长，不缩短）
             if (turn_on and state == true) or ((not turn_on) and state == false) then
-                handshake_until = mp.get_time() + delay
+                handshake_until = math.max(handshake_until, mp.get_time() + delay)
             end
             if turn_on then
                 if state == true then
@@ -405,9 +420,9 @@ local function turn_off_hdr(label, sync)
     info("%s：关闭系统 HDR", label)
     mp.osd_message("HDR: 自动恢复 SDR", 3)
 
-    -- 与切换命令同理：下发即视为显示器进入握手，避免旧的解除暂停定时器提前放行
+    -- 与切换命令同理：下发即视为显示器进入握手，避免旧的解除暂停定时器提前放行（只延长，不缩短）
     local delay = options.handshake_delay_off
-    handshake_until = mp.get_time() + delay
+    handshake_until = math.max(handshake_until, mp.get_time() + delay)
     state_version = state_version + 1   -- 在途查询的读数属于"关闭之前的世界"
     local gen = generation   -- 发起时的代次：异步回调回来时用它判断是否已经有新文件
 
@@ -435,15 +450,18 @@ local function turn_off_hdr(label, sync)
     end
 
     switch_inflight = switch_inflight + 1
+    switch_cap_warned = false
     switch_cap_until = math.max(switch_cap_until, mp.get_time() + delay + SWITCH_WAIT_CAP)
+    -- 看门狗（后台关闭时若还持有脚本暂停，命令卡死同样不能永久暂停）
+    if paused_by_script then release_pause_after(0.2) end
     run_hdrcmd({"off"}, function(success, result)
         switch_inflight = math.max(switch_inflight - 1, 0)
         state_version = state_version + 1
         if shutting_down then return end
         local status = hdrcmd_alive(success, result) and result.status or nil
         if status == 0 then
-            -- 以命令真正落地的时间为准刷新握手截止时间
-            handshake_until = mp.get_time() + delay
+            -- 以命令真正落地的时间为准刷新握手截止时间（只延长，不缩短）
+            handshake_until = math.max(handshake_until, mp.get_time() + delay)
             script_turned_on = false
             cached_state = false
             cached_state_valid = true
@@ -593,6 +611,14 @@ mp.register_event("start-file", function()
     cancel_turn_off_timer()
     -- 这里**不**丢弃挂起的"解除暂停"定时器：物理握手属于显示器而不是某个文件，
     -- 新文件应当继承剩余等待，否则切集后会在黑屏没结束时开播（漏首帧）。
+
+    -- 新文件从**加载这一刻**就受保护：显示器还在黑屏、或切换命令还没结算时，
+    -- 先取得暂停。黑屏与新文件是 HDR 还是 SDR 无关，不必等元数据检测完。
+    -- 不依赖 path：start-file 触发时它可能还指向上一部文件。
+    if switch_waiting() or handshake_until > mp.get_time() then
+        hold_pause()       -- 用户自己暂停时不接管
+        release_pause()    -- 有归属就按剩余时间（或命令结算）排期
+    end
 end)
 
 -- 【首帧秒断】：文件名命中 HDR 标签时不必等元数据，直接进入决策
