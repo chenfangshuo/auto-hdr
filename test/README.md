@@ -16,8 +16,10 @@
 
 **原理**：`test\stub-hdrcmd.cs` 顶替真实的 `HDRCmd.exe` —— 它用 `state.on` 文件模拟"HDR 开着"，
 把每次调用追加到 `calls.log`，还能用 `mode-fail` / `mode-unsupported` / `mode-off-fail` /
-`mode-slow-on` / `mode-slow-status` / `mode-slow-off` / `mode-slow-exit-on` 标记文件模拟异常、
-"命令/查询很慢"，以及"状态已经改了、进程还没退出"（`mode-slow-exit-on`）。
+`mode-slow-on` / `mode-slow-status` / `mode-slow-off` / `mode-slow-exit-on` /
+`mode-slow-exit-status` / `mode-slow-reread` 标记文件模拟异常、"命令/查询很慢"，以及
+"副作用已经发生、进程还没退出"（`mode-slow-exit-on`、`mode-slow-exit-status`）和
+"只拖慢失败之后的状态回读"（`mode-slow-reread`）。`Set-StubMode` 支持逗号分隔同时开多个模式。
 脚本再把 `auto-hdr.lua` 复制一份补丁成：指向 stub、开 `debug`、握手缩到 0.3 秒，
 然后用 mpv 真跑一遍事件流，最后断言脚本日志与 HDRCmd 的调用序列。
 
@@ -52,8 +54,13 @@
 | `--pause` 启动 | 脚本**不解除**用户自己的暂停 |
 | 握手等待期间切到下一部 HDR 片 | 新片**继承剩余握手时间**，不在黑屏未结束时开播（慢握手副本 2.0s） |
 | 上一部 `on` 在切集后才落地 | 重判路径同样等握手（`mode-slow-exit-on` + 慢握手副本） |
-| `on` 在途时退出 | 先 abort 在途请求、再同步补一次 `off`：`status,on,off`，退出后不留 HDR |
+| `on` 在途时退出 | 先 abort 在途请求、再同步关一次；`shutdown` 在 abort 之后补第二次：`status,on,off,off` |
 | 停止播放后 `on` 才落地 | 空闲分支归还脚本的暂停租约（探针读到的 `pause=false`） |
+| 查询读到 on、`off` 之后才返回 | 读数作废并**重查**，最终仍会开启 HDR（`off,.*on`） |
+| 状态查询在途时 stop | 过期回调在空闲时归还脚本暂停（探针 `pause=false`） |
+| `on` 比握手时长还慢时切到 SDR | 命令未结算前不放行（探针 `pause=true`） |
+| 后台 `off` 握手期间打开 SDR | 没有现成暂停也会建立保护（探针 `pause=true`） |
+| `on` 失败、回读期间退出 | 计数到结算才减：仍然补关 `status,on,status,off,off` |
 
 全部通过时退出码为 0，有失败项则为失败数量，方便接到别的地方跑。
 
@@ -85,5 +92,9 @@
     新集必须等黑屏结束才开播，不能在剩余黑屏里先跑掉片头。
 12. **开片立刻退出**：打开 HDR 片后 1 秒内点 ✕ —— 退出后系统应恢复 SDR（`on` 可能还在途，
     脚本会补一次关闭）。
+13. **查询中停止**：打开 HDR 片后立刻按停止（趁状态查询还没回来）—— mpv 应处于**非暂停**状态，
+    下次打开文件正常播放。
+14. **恢复 SDR 的黑屏期间打开 SDR 片**：播放中手动 stop，等 HDR 开始切回 SDR 时马上打开一个
+    SDR 文件 —— 新文件应等黑屏结束再开始播，不在黑屏里跑片头。
 
 排错时把 `options.debug` 设为 `true`，看 `[auto_hdr]` 日志（字段含义见 [../DEVELOPER.md](../DEVELOPER.md) 第 6 节）。

@@ -46,6 +46,9 @@ $modeSlowOn  = Join-Path $work "mode-slow-on"
 $modeSlowSt  = Join-Path $work "mode-slow-status"
 $modeSlowOff = Join-Path $work "mode-slow-off"
 $modeSlowExitOn = Join-Path $work "mode-slow-exit-on"
+$modeSlowExitSt = Join-Path $work "mode-slow-exit-status"
+$modeSlowReread = Join-Path $work "mode-slow-reread"
+$attemptPath = Join-Path $work "on-attempt"
 
 $stubSource = Join-Path $PSScriptRoot "stub-hdrcmd.cs"
 if (-not (Test-Path $stubSource)) { throw "找不到 $stubSource" }
@@ -159,17 +162,22 @@ $testLongVideo = "av://lavfi:testsrc=size=64x64:rate=5:duration=30"
 
 # ---------- 工具函数 ----------
 function Reset-Stub {
-    Remove-Item $callsPath, $statePath, $modeFail, $modeNoHdr, $modeOffFail, $modeSlowOn, $modeSlowSt, `
-        $modeSlowOff, $modeSlowExitOn -Force -ErrorAction SilentlyContinue
+    Remove-Item $callsPath, $statePath, $attemptPath, $modeFail, $modeNoHdr, $modeOffFail, $modeSlowOn, `
+        $modeSlowSt, $modeSlowOff, $modeSlowExitOn, $modeSlowExitSt, $modeSlowReread `
+        -Force -ErrorAction SilentlyContinue
 }
 function Set-StubMode([string]$Mode) {
-    if ($Mode -eq "fail")        { New-Item -ItemType File -Path $modeFail    | Out-Null }
-    if ($Mode -eq "unsupported") { New-Item -ItemType File -Path $modeNoHdr   | Out-Null }
-    if ($Mode -eq "offfail")     { New-Item -ItemType File -Path $modeOffFail | Out-Null }
-    if ($Mode -eq "slowon")      { New-Item -ItemType File -Path $modeSlowOn  | Out-Null }
-    if ($Mode -eq "slowstatus")  { New-Item -ItemType File -Path $modeSlowSt  | Out-Null }
-    if ($Mode -eq "slowoff")     { New-Item -ItemType File -Path $modeSlowOff | Out-Null }
-    if ($Mode -eq "slowexit")    { New-Item -ItemType File -Path $modeSlowExitOn | Out-Null }
+    # 支持逗号分隔同时开多个模式（例如 "slowexitstatus,slowoff"）
+    $modes = $Mode -split ','
+    if ($modes -contains "fail")            { New-Item -ItemType File -Path $modeFail    | Out-Null }
+    if ($modes -contains "unsupported")     { New-Item -ItemType File -Path $modeNoHdr   | Out-Null }
+    if ($modes -contains "offfail")         { New-Item -ItemType File -Path $modeOffFail | Out-Null }
+    if ($modes -contains "slowon")          { New-Item -ItemType File -Path $modeSlowOn  | Out-Null }
+    if ($modes -contains "slowstatus")      { New-Item -ItemType File -Path $modeSlowSt  | Out-Null }
+    if ($modes -contains "slowoff")         { New-Item -ItemType File -Path $modeSlowOff | Out-Null }
+    if ($modes -contains "slowexit")        { New-Item -ItemType File -Path $modeSlowExitOn | Out-Null }
+    if ($modes -contains "slowexitstatus")  { New-Item -ItemType File -Path $modeSlowExitSt | Out-Null }
+    if ($modes -contains "slowreread")      { New-Item -ItemType File -Path $modeSlowReread | Out-Null }
 }
 function Get-Calls {
     if (-not (Test-Path $callsPath)) { return @() }
@@ -376,8 +384,8 @@ Test-Case -Name "上一部 on 在切集后才落地 → 重判也等握手" -Slo
 # 否则退出后系统会停在 HDR。
 Test-Case -Name "on 在途时退出 → 同步补关，退出后不留 HDR" -Mode "slowexit" -QuitAfter 1 `
     -Media @("long.HDR.wav") `
-    -Expect @("mpv 退出：关闭系统 HDR") `
-    -CallsMatch "^status,on,off$"
+    -Expect @("mpv 退出：关闭系统 HDR", "mpv 关闭：关闭系统 HDR") `
+    -CallsMatch "^status,on,off,off$"
 
 # 停止播放之后 on 才回调：空闲分支要归还脚本的暂停租约
 # （pause 属性不会随文件卸载自动复位，只清标记会让下一个文件停在暂停上）
@@ -385,6 +393,41 @@ Test-Case -Name "停止播放后 on 才落地 → 空闲时归还暂停" -Mode "
     -StopAfter 1 -ProbeAfter 2.5 -QuitAfter 6 -Extra @("--idle=yes") `
     -Media @("long.HDR.wav") `
     -Expect @("TESTPROBE pause=false") -ExpectAbsent @("TESTPROBE pause=true")
+
+# ---------- 第四轮：查询有效性 / 退出结算 / 握手期间建立暂停 ----------
+
+# 片尾防抖的 off 还没落地时打开 HDR 片：B 的查询读到的是切换前的 "on"，
+# 之后 off 落地触发重判。重判不能复用那次旧读数，必须重查并重新开 HDR。
+# 时序：A 的首次查询故意也慢（1.8s 才开 HDR）→ 3s 停止 → 5.5s 发 off（7.0s 才落地）
+#       → 5.6s 打开 B（查询读到 on、7.15s 才返回）→ off 落地触发重判，复用旧读数就会让 B 在 SDR 下播。
+Test-Case -Name "旧查询跨过 off 落地 → 重判必须重查" -Mode "slowexitstatus,slowoff" `
+    -StopAfter 3 -LoadAfter 5.6 -LoadFile (Join-Path $work "movie.HDR.wav") -QuitAfter 14 `
+    -Extra @("--idle=yes") -Media @("long.HDR.wav") `
+    -Expect @("读数作废并重查", "HDR 已开启") -CallsMatch "off,.*on"
+
+# 状态查询在途时 stop：查询回调因代次过期不能再"什么都不做"，空闲时要归还暂停
+Test-Case -Name "状态查询在途时 stop → 空闲归还脚本暂停" -Mode "slowstatus" `
+    -StopAfter 1 -ProbeAfter 2.5 -QuitAfter 6 -Extra @("--idle=yes") `
+    -Media @("long.HDR.wav") `
+    -Expect @("TESTPROBE pause=false") -ExpectAbsent @("TESTPROBE pause=true")
+
+# on 比握手时长还慢时切到 SDR：定时器不能只看截止时间，命令未结算前不得放行
+Test-Case -Name "on 慢于握手时长时切到 SDR → 命令落地前不放行" -Mode "slowon" `
+    -NextAfter 0.6 -ProbeAfter 1.0 -QuitAfter 8 -Extra @("--idle=yes") `
+    -List @("long.HDR.wav", $testLongVideo) `
+    -Expect @("TESTPROBE pause=true") -ExpectAbsent @("TESTPROBE pause=false")
+
+# 后台 off 的握手还没结束时打开 SDR：没有现成暂停，也要为它建立播放保护
+Test-Case -Name "后台 off 握手期间打开 SDR → 建立暂停" -SlowHandshake -Mode "slowoff" `
+    -StopAfter 1 -LoadAfter 5.4 -LoadFile $testLongVideo -ProbeAfter 6.0 -QuitAfter 10 `
+    -Extra @("--idle=yes") -Media @("long.HDR.wav") `
+    -Expect @("TESTPROBE pause=true") -ExpectAbsent @("TESTPROBE pause=false")
+
+# on 非零退出、回读期间退出：在途计数要到"结算"才减，否则会漏掉退出清理
+Test-Case -Name "on 失败回读期间退出 → 仍然补关" -Mode "fail,slowreread" -QuitAfter 1 `
+    -Media @("long.HDR.wav") `
+    -Expect @("mpv 退出：关闭系统 HDR", "mpv 关闭：关闭系统 HDR") `
+    -CallsMatch "^status,on,status,off,off$"
 
 # ---------- 汇总 ----------
 Write-Host ""

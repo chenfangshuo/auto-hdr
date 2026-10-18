@@ -6,7 +6,12 @@
 // 用 Add-Type / csc.exe 把它编出来，不往仓库里放二进制。
 //
 // 行为对齐真实 HDRCmd 的退出码语义：
-//   status  有 mode-slow-status 时先睡 1.5 秒（构造"状态查询还没回来用户就切集"的竞态）
+//   status  有 mode-slow-status 时先睡 1.5 秒再读状态
+//           （构造"状态查询还没回来用户就切集"的竞态）
+//           有 mode-slow-exit-status 时**先读状态、再睡 1.5 秒**
+//           （构造"读到的是切换前的值、回调却晚于切换落地"—— 真实进程在启动时读状态）
+//           有 mode-slow-reread 且 on 已经失败过时睡 1.5 秒
+//           （只拖慢失败之后的那次状态回读，构造"回读期间退出"）
 //           有 mode-unsupported → 2（没有支持 HDR 的显示器）
 //           有 state.on        → 0（HDR 已开）
 //           否则              → 1（HDR 已关）
@@ -39,11 +44,16 @@ internal static class StubHdrCmd
         if (cmd == "status")
         {
             if (Has("mode-slow-status")) Thread.Sleep(1500);
-            if (Has("mode-unsupported")) return 2;
-            return Has("state.on") ? 0 : 1;
+            if (Has("mode-slow-reread") && Has("on-attempt")) Thread.Sleep(1500);
+            bool unsupported = Has("mode-unsupported");
+            bool on = Has("state.on");   // 先读状态，再慢慢退出
+            if (Has("mode-slow-exit-status")) Thread.Sleep(1500);
+            if (unsupported) return 2;
+            return on ? 0 : 1;
         }
         if (cmd == "on")
         {
+            File.WriteAllText(P("on-attempt"), "x");   // 供 mode-slow-reread 判断"失败回读"
             if (Has("mode-slow-exit-on"))
             {
                 File.WriteAllText(P("state.on"), "x");
