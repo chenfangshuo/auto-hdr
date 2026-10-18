@@ -3,7 +3,8 @@
 
     用假的 HDRCmd（运行时编译出的 stub.exe）驱动真实的 mpv 事件流，全程不碰真实显示器，
     可以随时反复运行。覆盖：文件名预判、元数据判定、快路径、防抖、状态复核、命令失败、
-    无 HDR 显示器、片尾关闭、退出关闭、路径写错、停止播放/切集的回调竞态、暂停所有权。
+    无 HDR 显示器、片尾关闭、退出关闭、路径写错、停止播放/切集的回调竞态、暂停所有权、
+    跨文件物理握手（慢握手副本）、退出时在途 on。
 
     用法：
         powershell -File test\run-tests.ps1
@@ -44,6 +45,7 @@ $modeOffFail = Join-Path $work "mode-off-fail"
 $modeSlowOn  = Join-Path $work "mode-slow-on"
 $modeSlowSt  = Join-Path $work "mode-slow-status"
 $modeSlowOff = Join-Path $work "mode-slow-off"
+$modeSlowExitOn = Join-Path $work "mode-slow-exit-on"
 
 $stubSource = Join-Path $PSScriptRoot "stub-hdrcmd.cs"
 if (-not (Test-Path $stubSource)) { throw "找不到 $stubSource" }
@@ -112,6 +114,15 @@ if ($patched -notmatch 'handshake_delay_on = 0\.3' -or $patched -notmatch 'debug
 }
 [System.IO.File]::WriteAllText($testScript, $patched, $utf8NoBom)
 
+# 握手 2.0 秒的副本：用来验证"物理握手跨文件有效"（0.3 秒太短，切集窗口构造不出来）。
+# 同样必须保持 auto-hdr.lua 文件名，否则 mpv 的日志前缀会变成 [auto_hdr_xxx] 被过滤器丢掉。
+$slowDir = Join-Path $work "slow"
+New-Item -ItemType Directory -Path $slowDir | Out-Null
+$testScriptSlow = Join-Path $slowDir "auto-hdr.lua"
+$slow = $patched -replace 'handshake_delay_(on|off) = [0-9.]+', 'handshake_delay_$1 = 2.0'
+if ($slow -notmatch 'handshake_delay_on = 2\.0') { throw "慢握手补丁没生效" }
+[System.IO.File]::WriteAllText($testScriptSlow, $slow, $utf8NoBom)
+
 # 同一份脚本、但 hdr_cmd_path 指向不存在的文件：验证"查不到状态就旁路"
 # 注意两点：用正斜杠（Lua 字符串里 "\n" 是换行、"\H" 是非法转义，写反斜杠会把脚本写坏）；
 # 副本要放在独立目录里并保持 auto-hdr.lua 这个文件名 —— mpv 用**文件名**给日志加前缀，
@@ -148,8 +159,8 @@ $testLongVideo = "av://lavfi:testsrc=size=64x64:rate=5:duration=30"
 
 # ---------- 工具函数 ----------
 function Reset-Stub {
-    Remove-Item $callsPath, $statePath, $modeFail, $modeNoHdr, $modeOffFail, $modeSlowOn, $modeSlowSt, $modeSlowOff `
-        -Force -ErrorAction SilentlyContinue
+    Remove-Item $callsPath, $statePath, $modeFail, $modeNoHdr, $modeOffFail, $modeSlowOn, $modeSlowSt, `
+        $modeSlowOff, $modeSlowExitOn -Force -ErrorAction SilentlyContinue
 }
 function Set-StubMode([string]$Mode) {
     if ($Mode -eq "fail")        { New-Item -ItemType File -Path $modeFail    | Out-Null }
@@ -158,6 +169,7 @@ function Set-StubMode([string]$Mode) {
     if ($Mode -eq "slowon")      { New-Item -ItemType File -Path $modeSlowOn  | Out-Null }
     if ($Mode -eq "slowstatus")  { New-Item -ItemType File -Path $modeSlowSt  | Out-Null }
     if ($Mode -eq "slowoff")     { New-Item -ItemType File -Path $modeSlowOff | Out-Null }
+    if ($Mode -eq "slowexit")    { New-Item -ItemType File -Path $modeSlowExitOn | Out-Null }
 }
 function Get-Calls {
     if (-not (Test-Path $callsPath)) { return @() }
@@ -214,6 +226,7 @@ function Test-Case {
         [double]$LoadAfter = 0,
         [string]$LoadFile = "",
         [switch]$BadPath,
+        [switch]$SlowHandshake,     # 用握手 2.0 秒的副本（构造跨文件握手的窗口）
         [string[]]$Extra = @(),
         [string[]]$Expect = @(),
         [string[]]$ExpectAbsent = @(),
@@ -233,7 +246,9 @@ function Test-Case {
     $log = Invoke-Mpv -Files $files -QuitAfter $QuitAfter -Extra $Extra -StopAfter $StopAfter `
                       -NextAfter $NextAfter -ProbeAfter $ProbeAfter `
                       -LoadAfter $LoadAfter -LoadFile $LoadFile `
-                      -ScriptPath $(if ($BadPath) { $testScriptBad } else { $testScript })
+                      -ScriptPath $(if ($BadPath) { $testScriptBad }
+                                    elseif ($SlowHandshake) { $testScriptSlow }
+                                    else { $testScript })
     $logText = ($log -join "`n")
     $calls = Get-Calls
     $callsText = ($calls -join ",")
@@ -321,7 +336,7 @@ Test-Case -Name "停止播放打断在途的 on → 空闲不留 HDR" -Media @("
 Test-Case -Name "命令在途时切到 SDR → 旧结论不套用到新文件" -Mode "slowon" -NextAfter 0.6 `
     -QuitAfter 10 -Extra @("--idle=yes") -List @("long.HDR.wav", $testLongVideo) `
     -Expect @("回调返回时文件已变化", "HDR 已关闭（元数据") `
-    -CallsMatch "^status,on,off$"
+    -CallsMatch "^status,on,status,off$"
 
 Test-Case -Name "状态查询在途时切到 SDR → 判定直接丢弃" -Mode "slowstatus" -NextAfter 0.6 `
     -QuitAfter 10 -Extra @("--idle=yes") -List @("long.HDR.wav", $testLongVideo) `
@@ -340,6 +355,36 @@ Test-Case -Name "防抖关闭在途时打开新 HDR 片 → 关闭落地后会�
 Test-Case -Name "--pause 启动 → 脚本不解除用户的暂停" -Media @("movie.HDR.wav") -QuitAfter 6 `
     -Extra @("--pause") -ProbeAfter 5 `
     -Expect @("TESTPROBE pause=true") -ExpectAbsent @("TESTPROBE pause=false")
+
+# ---------- 第三轮：物理握手跨文件 / 退出在途 on / 空闲暂停租约 ----------
+
+# A 已开启 HDR、显示器还在黑屏里，用户切到下一部 HDR 片：
+# 新片不能因为"系统状态已经是 HDR"就立刻开播，必须继承剩余的握手时间。
+Test-Case -Name "握手等待期间切到下一部 HDR 片 → 继续等剩余时间" -SlowHandshake `
+    -NextAfter 0.6 -ProbeAfter 1.0 -QuitAfter 8 `
+    -List @("long.HDR.wav", "movie.HDR.wav") `
+    -Expect @("TESTPROBE pause=true") -ExpectAbsent @("TESTPROBE pause=false")
+
+# 上一部影片的 on 在切集之后才落地（副作用已发生、回调晚到）：
+# 重判路径同样要沿用握手，不能立即解除暂停。
+Test-Case -Name "上一部 on 在切集后才落地 → 重判也等握手" -SlowHandshake -Mode "slowexit" `
+    -NextAfter 0.6 -ProbeAfter 2.0 -QuitAfter 8 `
+    -List @("long.HDR.wav", "movie.HDR.wav") `
+    -Expect @("TESTPROBE pause=true") -ExpectAbsent @("TESTPROBE pause=false")
+
+# on 已经改了系统状态、回调还没回来时退出：不能因为 script_turned_on 还是 false 就漏关，
+# 否则退出后系统会停在 HDR。
+Test-Case -Name "on 在途时退出 → 同步补关，退出后不留 HDR" -Mode "slowexit" -QuitAfter 1 `
+    -Media @("long.HDR.wav") `
+    -Expect @("mpv 退出：关闭系统 HDR") `
+    -CallsMatch "^status,on,off$"
+
+# 停止播放之后 on 才回调：空闲分支要归还脚本的暂停租约
+# （pause 属性不会随文件卸载自动复位，只清标记会让下一个文件停在暂停上）
+Test-Case -Name "停止播放后 on 才落地 → 空闲时归还暂停" -Mode "slowon" `
+    -StopAfter 1 -ProbeAfter 2.5 -QuitAfter 6 -Extra @("--idle=yes") `
+    -Media @("long.HDR.wav") `
+    -Expect @("TESTPROBE pause=false") -ExpectAbsent @("TESTPROBE pause=true")
 
 # ---------- 汇总 ----------
 Write-Host ""

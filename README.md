@@ -56,7 +56,7 @@ The rest of this file, [DEVELOPER.md](DEVELOPER.md) and the source comments are 
 | 参数 | 默认 | 什么时候改 |
 | :--- | :--- | :--- |
 | `hdr_cmd_path` | `C:\\Program Files\\mpv\\HDRCmd.exe` | HDRCmd.exe 不在这个位置时。**Lua 里反斜杠必须写两个** |
-| `handshake_delay_on` | `3.9` 秒 | **开** HDR 时等显示器黑屏结束的时间。画面亮了才开始播 → 调大；黑屏早结束了还在等 → 调小 |
+| `handshake_delay_on` | `3.9` 秒 | **开** HDR 时等显示器黑屏结束的时间。画面亮起时片头已经播掉一截 → 调大；黑屏早结束了画面还在等 → 调小 |
 | `handshake_delay_off` | `3.9` 秒 | **关** HDR 时的同一等待。开 HDR 的黑屏通常比关更长，所以两个值分开配 |
 
 其余参数（判定逻辑、状态缓存、调试日志等）见 [DEVELOPER.md](DEVELOPER.md)。
@@ -82,3 +82,6 @@ The rest of this file, [DEVELOPER.md](DEVELOPER.md) and the source comments are 
 
 * **多显示器**：`HDRCmd.exe` 会连带切换**所有**支持 HDR 的屏幕，脚本不区分主副屏。
 * **只关自己开的**：系统 HDR 如果是你手动开的，脚本看完不会替你关。
+  判断依据是**开播那一刻**的真实状态；如果你在脚本开了 HDR 之后又手动关/开，脚本分不清是谁开的，
+  片尾仍可能按"这是自己开的"去关。
+* **多开 mpv**：每个播放器实例各自记账、互不感知。A 窗口开着 HDR 时，B 窗口退出仍可能把它关掉。

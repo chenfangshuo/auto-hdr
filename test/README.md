@@ -16,7 +16,8 @@
 
 **原理**：`test\stub-hdrcmd.cs` 顶替真实的 `HDRCmd.exe` —— 它用 `state.on` 文件模拟"HDR 开着"，
 把每次调用追加到 `calls.log`，还能用 `mode-fail` / `mode-unsupported` / `mode-off-fail` /
-`mode-slow-on` / `mode-slow-status` / `mode-slow-off` 标记文件模拟异常与"命令/查询很慢"。
+`mode-slow-on` / `mode-slow-status` / `mode-slow-off` / `mode-slow-exit-on` 标记文件模拟异常、
+"命令/查询很慢"，以及"状态已经改了、进程还没退出"（`mode-slow-exit-on`）。
 脚本再把 `auto-hdr.lua` 复制一份补丁成：指向 stub、开 `debug`、握手缩到 0.3 秒，
 然后用 mpv 真跑一遍事件流，最后断言脚本日志与 HDRCmd 的调用序列。
 
@@ -49,6 +50,10 @@
 | **状态查询**在途时切到 SDR | 判定直接丢弃（`状态查询回调时文件已变化`），SDR 片不会被点亮 HDR |
 | 防抖关闭在途时打开新 HDR 片 | 关闭落地后补一次判断：HDR 片不会在 SDR 下播（日志出现 `异步回调返回时文件已变化` 与 `HDR 已开启`） |
 | `--pause` 启动 | 脚本**不解除**用户自己的暂停 |
+| 握手等待期间切到下一部 HDR 片 | 新片**继承剩余握手时间**，不在黑屏未结束时开播（慢握手副本 2.0s） |
+| 上一部 `on` 在切集后才落地 | 重判路径同样等握手（`mode-slow-exit-on` + 慢握手副本） |
+| `on` 在途时退出 | 先 abort 在途请求、再同步补一次 `off`：`status,on,off`，退出后不留 HDR |
+| 停止播放后 `on` 才落地 | 空闲分支归还脚本的暂停租约（探针读到的 `pause=false`） |
 
 全部通过时退出码为 0，有失败项则为失败数量，方便接到别的地方跑。
 
@@ -76,5 +81,9 @@
    应看到 OSD「HDR: 无法获取系统 HDR 状态，已跳过」+ 日志「系统 HDR 状态查询失败」，
    画面正常播放（只是不切 HDR）。确认后把路径改回来。
 10. **`--pause` 启动**：`mpv --pause 某HDR片.mkv` 应在切换完成后**保持暂停**，等你按空格。
+11. **黑屏期间切下一集**：连播 HDR 时，在第一集的黑屏还没结束就手动切到下一集 ——
+    新集必须等黑屏结束才开播，不能在剩余黑屏里先跑掉片头。
+12. **开片立刻退出**：打开 HDR 片后 1 秒内点 ✕ —— 退出后系统应恢复 SDR（`on` 可能还在途，
+    脚本会补一次关闭）。
 
 排错时把 `options.debug` 设为 `true`，看 `[auto_hdr]` 日志（字段含义见 [../DEVELOPER.md](../DEVELOPER.md) 第 6 节）。

@@ -4,10 +4,11 @@
 
     设计要点：
       * 系统 HDR 的真实状态以 HDRCmd.exe 的退出码为准（0=开 / 1=关 / 2=不支持），
-        每次决策前异步复核 + 短时缓存，不再使用"启动时读一次"的影子状态，
+        每次决策前都异步实时复核，不再使用"启动时读一次"的影子状态，
         因此播放中手动切换 HDR 也不会让脚本判断失真。
-      * 视频是否 HDR 以 video-params/gamma 为准（"pq"/"hlg" 即 HDR）；
-        gamma 未标记（"auto"）时借助 primaries / sig-peak，最后才用文件名兜底。
+      * 视频是否 HDR：文件名命中 HDR 标签时直接按 HDR 处理（不等元数据）；
+        否则以 video-params/gamma 为准（"pq"/"hlg" 即 HDR），gamma 未标记（"auto"）时
+        借助 primaries / sig-peak，仍不确定才用文件名兜底。
       * 只在确实需要切换时才暂停画面，切完回退到开头以避免丢首帧；
         系统本来就处于目标状态时不做任何停顿。
 ]]
@@ -40,7 +41,8 @@ local options = {
     check_interval = 0.1,
     metadata_timeout = 1.5,
 
-    -- 系统 HDR 状态查询结果的缓存时长（秒），用于合并短时间内的重复查询。
+    -- "最近一次查到的系统状态"可信多久（秒）。只用于打开文件时决定要不要先锁住画面，
+    -- 真正的切换决策一律实时查询，不读这个缓存。
     state_cache_ttl = 1.5,
 
     -- 调试日志：设为 true 后，mpv 日志里会打印状态查询结果、元数据判定与命令执行结果
@@ -57,6 +59,13 @@ local turn_off_timer = nil       -- 播放结束后的关机倒计时
 local current_playing_path = ""  -- 当前视频路径，用于避免 seek/重载时重复触发检测
 local generation = 0             -- 每次开始加载新文件 / 文件被卸载都 +1，用于丢弃上一部影片遗留的异步回调
 local restage_current_file       -- 前置声明（定义在事件区）：切换回调过期时按当前状态重新收尾
+
+-- 物理握手属于**显示器**，不属于某个文件：切集可以丢弃上一部影片的回调，
+-- 但显示器还黑着这件事必须沿用，否则新文件会在剩余黑屏里开播（漏首帧）。
+local handshake_until = -math.huge  -- 最近一次切换的握手截止时间（mp.get_time 基准）
+local turn_on_inflight = 0          -- 已下发、回调还没返回的 on 数量（退出时要补关）
+local inflight_on_requests = {}     -- 在途 on 的异步请求 id，退出时可以逐个 abort
+local shutting_down = false         -- 已进入退出流程：不再产生新的异步工作
 
 -- 系统 HDR 状态缓存：cached_state 为 true/false；nil 表示"不支持 HDR 或查询失败"
 local cached_state = nil
@@ -108,10 +117,23 @@ local function run_hdrcmd(extra, callback)
         playback_only = false
     }
     if callback then
-        mp.command_native_async(args, callback)
+        -- 返回请求 id，on 在途时可以 abort（见 abort_inflight_on）
+        return mp.command_native_async(args, callback)
     else
         return mp.command_native(args)
     end
+end
+
+-- 退出路径：尽量取消还没结束的 on。
+-- 取消只代表"别让进程继续跑"，**不代表已经发生的系统状态被撤销**，
+-- 所以调用方必须在取消之后再同步下发一次 off（两者都要做）。
+local function abort_inflight_on()
+    if mp.abort_async_command then
+        for req in pairs(inflight_on_requests) do
+            mp.abort_async_command(req)
+        end
+    end
+    inflight_on_requests = {}
 end
 
 -- 是否真的执行成功（进程起不来时 mpv 不抛错，只在结果里体现：error_string == "init"）
@@ -121,14 +143,11 @@ local function hdrcmd_alive(success, result)
         and result.killed_by_us ~= true
 end
 
+-- 查询系统真实状态。**切换决策一律用实时查询，不读缓存**：
+-- 缓存只用于 file-loaded 决定"要不要在查询前先锁住画面"。
+-- 否则用户在缓存有效期（1.5 秒）内手动开关 HDR 时，脚本可能把用户的操作
+-- 认领成"自己开的"，片尾再替人关掉。
 local function query_hdr_state(callback)
-    local now = mp.get_time()
-    if cached_state_valid and (now - cached_state_time) < options.state_cache_ttl then
-        log("HDR 状态命中缓存：%s", tostring(cached_state))
-        callback(cached_state)
-        return
-    end
-
     -- 同一时刻的多个请求合并成一次查询
     if state_waiters then
         state_waiters[#state_waiters + 1] = callback
@@ -140,20 +159,12 @@ local function query_hdr_state(callback)
         local state = nil
         if hdrcmd_alive(success, result) then
             local code = result.status
+            -- HDRCmd 的 `status -m x` 只返回退出码、不打印文本（文本在默认 short 模式）：
+            -- 0=开 / 1=关 / 2=不支持，其它值（含异常退出）一律当作"查不到"整体旁路。
             if code == 0 then
-                state = true            -- HDR 已开启
+                state = true
             elseif code == 1 then
-                state = false           -- HDR 已关闭
-            elseif code == 2 then
-                state = nil             -- 没有任何支持 HDR 的显示器
-            else
-                -- Windows 上正常退出也可能得到负值（win32 伪影），退回解析文本
-                local out = string.lower(result.stdout or "")
-                if out:find("hdr is on", 1, true) then
-                    state = true
-                elseif out:find("hdr is off", 1, true) then
-                    state = false
-                end
+                state = false
             end
             log("系统 HDR 状态：%s（退出码 %s）", tostring(state), tostring(code))
         else
@@ -183,23 +194,19 @@ local function hold_pause()
     mp.set_property_bool("pause", true)
 end
 
--- 立即归还暂停（仅当暂停是本脚本造成的）
-local function release_pause()
-    if unpause_timer then
-        unpause_timer:kill()
-        unpause_timer = nil
-    end
-    if paused_by_script then
-        paused_by_script = false
-        mp.set_property_bool("pause", false)
-    end
-end
-
--- 握手完成后归还暂停
+-- 物理握手结束后归还暂停。
+-- 定时器到点时会**再核对一次截止时间**：等待期间可能又发生了一次切换，
+-- 此时要按新的截止时间重排，而不能按旧时间把画面放出来 —— 否则新文件的
+-- 黑屏还没结束就开始播，正是初版"上一部片子的握手解除新文件暂停"那个 bug 的翻版。
 local function release_pause_after(delay)
     if unpause_timer then unpause_timer:kill() end
     unpause_timer = mp.add_timeout(delay, function()
         unpause_timer = nil
+        local remain = handshake_until - mp.get_time()
+        if paused_by_script and remain > 0 then
+            release_pause_after(remain)
+            return
+        end
         if paused_by_script then
             paused_by_script = false
             mp.set_property_bool("pause", false)
@@ -207,12 +214,22 @@ local function release_pause_after(delay)
     end)
 end
 
--- 丢弃挂起的解除暂停（用于切集：上一部片子的握手不能作用到新文件上）
-local function drop_pending_unpause()
+-- 立即归还暂停（仅当暂停是本脚本造成的）。
+-- 显示器还在物理握手时不能立刻放画面，改为等剩余时间。
+local function release_pause()
     if unpause_timer then
         unpause_timer:kill()
         unpause_timer = nil
     end
+    if not paused_by_script then return end
+
+    local remain = handshake_until - mp.get_time()
+    if remain > 0 then
+        release_pause_after(remain)
+        return
+    end
+    paused_by_script = false
+    mp.set_property_bool("pause", false)
 end
 
 local function cancel_turn_off_timer()
@@ -238,16 +255,34 @@ local function do_switch_command(turn_on, trigger_reason)
     local action = turn_on and "on" or "off"
     local gen = generation   -- 发起时的代次：回调回来时用它判断文件是否已经变了
 
+    -- 从下发这一刻起就延长握手截止时间：命令回调可能比旧的等待定时器晚到
+    -- （冷启动、杀毒扫描等），只在回调里刷新会留下"旧定时器先到点把画面放了"的窗口。
+    handshake_until = mp.get_time() + delay
+
     hold_pause()
     rewind_if_needed()
     mp.osd_message(turn_on and "HDR: 正在准备开启..." or "HDR: 正在切回 SDR...", 2)
 
-    run_hdrcmd({action}, function(success, result)
+    if turn_on then turn_on_inflight = turn_on_inflight + 1 end
+    local req
+    local callback_ran = false
+    req = run_hdrcmd({action}, function(success, result)
+        callback_ran = true
+        if turn_on then
+            turn_on_inflight = math.max(turn_on_inflight - 1, 0)
+            if req then inflight_on_requests[req] = nil end
+        end
+        -- 退出流程中：退出路径已经（或即将）同步下发 off，这里不再 settle、不再查状态
+        if shutting_down then return end
         local alive = hdrcmd_alive(success, result)
         local code = alive and result.status or nil
         log("HDRCmd %s 结束：success=%s status=%s", action, tostring(success), tostring(code))
 
         local function settle(state)
+            -- 切换真的生效：以命令落地的时间为起点刷新物理握手截止时间
+            if (turn_on and state == true) or ((not turn_on) and state == false) then
+                handshake_until = mp.get_time() + delay
+            end
             if turn_on then
                 if state == true then
                     script_turned_on = true
@@ -277,7 +312,7 @@ local function do_switch_command(turn_on, trigger_reason)
             if gen ~= generation or mp.get_property("path", "") == "" then
                 restage_current_file()
             else
-                release_pause_after(delay)
+                release_pause()
             end
         end
 
@@ -292,11 +327,15 @@ local function do_switch_command(turn_on, trigger_reason)
             -- 退出码异常：以回读到的真实状态为准，避免"假成功"污染内部状态
             cached_state_valid = false
             query_hdr_state(function(state)
+                if shutting_down then return end
                 settle(state)
                 finish()
             end)
         end
     end)
+    if turn_on and req and not callback_ran and not shutting_down then
+        inflight_on_requests[req] = true
+    end
 end
 
 -- 供片尾/退出复用的关闭动作（sync=true 用于 mpv 退出前的同步下发）
@@ -304,6 +343,9 @@ local function turn_off_hdr(label, sync)
     info("%s：关闭系统 HDR", label)
     mp.osd_message("HDR: 自动恢复 SDR", 3)
 
+    -- 与切换命令同理：下发即视为显示器进入握手，避免旧的解除暂停定时器提前放行
+    local delay = options.handshake_delay_off
+    handshake_until = mp.get_time() + delay
     local gen = generation   -- 发起时的代次：异步回调回来时用它判断是否已经有新文件
 
     if sync then
@@ -318,6 +360,7 @@ local function turn_off_hdr(label, sync)
         -- 随后触发的 shutdown 还会再试一次。
         if res and res.error_string ~= "init" and res.killed_by_us ~= true and res.status == 0 then
             script_turned_on = false
+            turn_on_inflight = 0   -- 退出前的最终 off 已落地，不再等那些回调
             cached_state = false
             cached_state_valid = true
             cached_state_time = mp.get_time()
@@ -329,8 +372,11 @@ local function turn_off_hdr(label, sync)
     end
 
     run_hdrcmd({"off"}, function(success, result)
+        if shutting_down then return end
         local status = hdrcmd_alive(success, result) and result.status or nil
         if status == 0 then
+            -- 以命令真正落地的时间为准刷新握手截止时间
+            handshake_until = mp.get_time() + delay
             script_turned_on = false
             cached_state = false
             cached_state_valid = true
@@ -340,7 +386,7 @@ local function turn_off_hdr(label, sync)
         end
 
         -- 关闭期间恰好有文件开始播：它可能已经按"系统还是 HDR"做过判断
-        -- （缓存命中 → 无缝衔接，于是什么也没做）。现在 HDR 真的被关了，
+        -- （判成无缝衔接，于是什么也没做）。现在 HDR 真的被关了，
         -- 得让它按当前状态重跑一次，否则 HDR 片会在 SDR 下播。
         if gen ~= generation and status == 0 then
             restage_current_file()
@@ -380,6 +426,7 @@ local function do_hdr_switch(is_movie_hdr, trigger_reason)
     local gen = generation
 
     query_hdr_state(function(sys_hdr)
+        if shutting_down then return end
         -- 查询期间用户切集或停止播放了：这份结论属于上一部影片，直接丢弃。
         -- 这里连暂停都不要碰（新文件可能正处在自己的握手里），也不用收尾：
         -- 切集时新文件自己的事件流会重新判定；停止播放时这条路径还没下发过任何命令。
@@ -427,10 +474,10 @@ local function is_hdr_filename(name)
     -- 两端补 "."，让位于开头/结尾的标签也能吃到边界
     local s = "." .. string.lower(name) .. "."
     if s:find("[^a-z]hdr[^a-z]")            -- hdr / hdr10 / hdr10+，排除 hdrip
-       or s:find("dovi")
+       or s:find("[^a-z]dovi[^a-z]")        -- DoVi，同样要求词边界
        or s:find("dolby[%s%.%-_]?vision")
        or s:find("[%s%.%-_]dv[%s%.%-_]")
-       or s:find("smpte2084")
+       or s:find("[^a-z]smpte2084[^a-z]")
        or s:find("[^a-z]hlg[^a-z]") then    -- 同上，排除 hlgs 之类
         return true
     end
@@ -465,11 +512,12 @@ end
 
 -- ==================== 事件绑定 ====================
 
--- 新文件开始加载：立刻取消上一集遗留的关机倒计时与解除暂停
+-- 新文件开始加载：取消上一集遗留的关机倒计时（物理握手的剩余等待要沿用）
 mp.register_event("start-file", function()
     generation = generation + 1
     cancel_turn_off_timer()
-    drop_pending_unpause()
+    -- 这里**不**丢弃挂起的"解除暂停"定时器：物理握手属于显示器而不是某个文件，
+    -- 新文件应当继承剩余等待，否则切集后会在黑屏没结束时开播（漏首帧）。
 end)
 
 -- 【首帧秒断】：文件名命中 HDR 标签时不必等元数据，直接进入决策
@@ -482,8 +530,12 @@ mp.register_event("file-loaded", function()
     cancel_turn_off_timer()
     if check_timer then check_timer:kill(); check_timer = nil end
 
-    -- 已知系统不是 HDR 时立刻锁住画面；已知已是 HDR 则不停顿，等复核结果
-    if not (cached_state_valid and cached_state == true) then
+    -- 已知系统不是 HDR 时立刻锁住画面；已知已是 HDR 则不停顿，等复核结果。
+    -- 这里只是"要不要先锁画面"的启发式，所以只信 TTL 内的状态；
+    -- 真正的切换决策一律用实时查询（见 query_hdr_state）。
+    local cache_fresh = cached_state_valid
+        and (mp.get_time() - cached_state_time) < options.state_cache_ttl
+    if not (cache_fresh and cached_state == true) then
         hold_pause()
     end
     do_hdr_switch(true, "文件名预判")
@@ -507,6 +559,15 @@ local function start_checking()
 
     cancel_turn_off_timer()
     if check_timer then check_timer:kill(); check_timer = nil end
+
+    -- 与 file-loaded 保持同一套策略：命中 HDR 标签就先按文件名定案。
+    -- 正常加载时走不到这里（file-loaded 已登记路径，上面的去重会返回），
+    -- 只有 restage_current_file() 的竞态重判需要这一步，
+    -- 免得"初次加载按文件名、重判按元数据"两套口径。
+    if is_hdr_filename(mp.get_property("filename", "")) then
+        do_hdr_switch(true, "文件名预判")
+        return
+    end
 
     local deadline = mp.get_time() + options.metadata_timeout
 
@@ -542,17 +603,21 @@ mp.register_event("playback-restart", start_checking)
 -- 上一部影片的结论不能拿来收尾，改为按当前状态重新判定一次。
 -- 定义在这里是因为它要用到 start_checking（前置声明在文件上方）。
 restage_current_file = function()
+    if shutting_down then return end
     log("异步回调返回时文件已变化（切集或已停止），改为按当前状态收尾")
 
     if mp.get_property("path", "") == "" then
         -- 只是停止播放、没有新文件：此时 settle() 刚把 script_turned_on 置为 true，
-        -- 正好由防抖关闭接管，否则空闲状态下 HDR 会一直亮着
+        -- 正好由防抖关闭接管，否则空闲状态下 HDR 会一直亮着。
+        -- 同时归还脚本的暂停租约：pause 属性会带到下一个文件，
+        -- 只清标记而不真正解除，下一个文件就可能永远停在暂停上。
+        release_pause()
         schedule_turn_off("播放结束且无新视频")
         return
     end
 
-    current_playing_path = ""   -- 清掉去重标记，让 start_checking 对新文件重跑一遍
-    start_checking()
+    current_playing_path = ""   -- 清掉去重标记，让检测对新文件重跑一遍
+    start_checking()            -- 内部会按"文件名优先"的策略分流
 end
 
 -- 播放结束/切集/退出
@@ -562,21 +627,31 @@ mp.register_event("end-file", function(e)
     generation = generation + 1
     if check_timer then check_timer:kill(); check_timer = nil end
 
-    if not script_turned_on then return end
-
     if e.reason == "quit" then
-        -- 播放器直接退出：必须同步下发，否则进程销毁后命令无法送达
-        turn_off_hdr("mpv 退出", true)
-    else
-        -- 其它结束原因（手动 stop、被 loadfile 打断等）：走防抖倒计时。
-        -- 播到结尾不算 —— keep-open 下文件没被卸载，end-file 本就不会来。
-        schedule_turn_off("播放结束且无新视频")
+        -- 播放器直接退出：先进入"退出中"状态，禁止任何回调再起新的切换
+        shutting_down = true
+        local on_inflight = turn_on_inflight > 0
+        abort_inflight_on()
+        -- on 可能已经在途（script_turned_on 还没来得及置真）：两种都要算上，
+        -- 否则退出时系统会停在 HDR。
+        if script_turned_on or on_inflight then
+            turn_off_hdr("mpv 退出", true)
+        end
+        return
     end
+
+    if not script_turned_on then return end
+    -- 其它结束原因（手动 stop、被 loadfile 打断等）：走防抖倒计时。
+    -- 播到结尾不算 —— keep-open 下文件没被卸载，end-file 本就不会来。
+    schedule_turn_off("播放结束且无新视频")
 end)
 
 -- 兜底：空闲状态下退出（没有 end-file）或 --idle 启动时，仍要恢复 SDR
 mp.register_event("shutdown", function()
-    if script_turned_on then
+    shutting_down = true
+    local on_inflight = turn_on_inflight > 0
+    abort_inflight_on()
+    if script_turned_on or on_inflight then
         turn_off_hdr("mpv 关闭", true)
     end
 end)

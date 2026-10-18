@@ -11,6 +11,8 @@
 //           有 state.on        → 0（HDR 已开）
 //           否则              → 1（HDR 已关）
 //   on      有 mode-slow-on 时先睡 1.5 秒（用来构造"命令还在途时切集/停止"的竞态）
+//           有 mode-slow-exit-on 时**先写 state.on 再睡 1.5 秒**（模拟"副作用已经发生、
+//                                 回调还没到达"的退出窗口 —— 与实际 HDRCmd 先改状态再退出一致）
 //           有 mode-fail      → 3（模拟切换失败）
 //           否则写 state.on 并返回 0
 //   off     有 mode-slow-off 时先睡 1.5 秒（构造"关闭还没落地新片就开播"的竞态）
@@ -42,6 +44,12 @@ internal static class StubHdrCmd
         }
         if (cmd == "on")
         {
+            if (Has("mode-slow-exit-on"))
+            {
+                File.WriteAllText(P("state.on"), "x");
+                Thread.Sleep(1500);
+                return 0;
+            }
             if (Has("mode-slow-on")) Thread.Sleep(1500);
             if (Has("mode-fail")) return 3;
             File.WriteAllText(P("state.on"), "x");
