@@ -18,18 +18,29 @@
 **原理**：`test\stub-hdrcmd.cs` 顶替真实的 `HDRCmd.exe` —— 它用 `state.on` 文件模拟"HDR 开着"，
 把每次调用追加到 `calls.log`，还能用 `mode-fail` / `mode-unsupported` / `mode-off-fail` /
 `mode-slow-on` / `mode-slow-status` / `mode-slow-off` / `mode-slow-exit-on` /
-`mode-slow-exit-status` / `mode-slow-reread` 标记文件模拟异常、"命令/查询很慢"，以及
-"副作用已经发生、进程还没退出"（`mode-slow-exit-on`、`mode-slow-exit-status`）和
-"只拖慢失败之后的状态回读"（`mode-slow-reread`）。`Set-StubMode` 支持逗号分隔同时开多个模式。
+`mode-slow-exit-status` / `mode-slow-reread` / `mode-hang-on` / `mode-hang-status` /
+`mode-slow-status-once` / `mode-on-effect-then-fail` / `mode-reread-error` /
+`mode-manual-on-after-status` 标记文件模拟
+异常、"命令/查询很慢/卡死"，以及"副作用已经发生、进程还没退出或异常失败"
+（`mode-slow-exit-on`、`mode-on-effect-then-fail`）、"只拖慢失败之后的状态回读"
+（`mode-slow-reread`）、"回读也拿不到状态"（`mode-reread-error`，只消费一次）和
+"查询读到 off 后、命令下发前用户把 HDR 打开了"（`mode-manual-on-after-status`）。
+`Set-StubMode` 支持逗号分隔同时开多个模式。
 脚本再把 `auto-hdr.lua` 复制一份补丁成：指向 stub、开 `debug`、握手缩到 0.3 秒，
-然后用 mpv 真跑一遍事件流，最后断言脚本日志与 HDRCmd 的调用序列。
+然后用 mpv 真跑一遍事件流，最后断言脚本日志、HDRCmd 的调用序列与 `state.on` 的最终状态。
+
+"文件还在打开中"这类窗口由测试内起的**本机 HTTP 服务**构造：连接立刻建立，响应故意拖后
+或直接断开（不依赖外网/网络环境），这样 `path` 已有值但 `file-loaded` 还没来。
+另有一个把 `on` 的可执行路径指向不存在文件的脚本副本，用来模拟 `CreateProcess` 失败
+（`error_string == "init"`）；它只改 `on`，`status`/`off` 仍走替身。
+还有一个"超时后不 abort"的副本，让迟到的 status 结果真的返回，用来验证尝试编号的隔离。
 
 替身需要**运行时编译成 exe**（`run-tests.ps1` 用 `%WINDIR%\Microsoft.NET\Framework64\v4.0.30319\csc.exe`，
 没有就退回 `Add-Type`）。原因是脚本现在直接调用 `HDRCmd.exe`，而 Windows 的 `CreateProcess`
 只认可执行映像，`.bat` 会直接失败（`error_string == "init"`）。仓库里只存 `.cs` 源码，不放二进制。
 
-脚本与 HDRCmd 之间的约定只有两条：**退出码**（0=开 / 1=关 / 2=不支持 / 非 0=失败）
-和 stdout 里的 `HDR is on|off|unsupported`，所以 stub 可以完整替代真身。
+脚本与 HDRCmd 之间的约定只有**退出码**（status：0=开 / 1=关 / 2=不支持；on/off：0=一致、
+非 0=失败）。`status -m x` **不输出 stdout**，脚本也不解析文本，所以 stub 不需要模拟任何输出。
 
 覆盖的用例：
 
@@ -64,6 +75,16 @@
 | `on` 失败、回读期间退出 | 计数到结算才减：仍然补关 `status,on,status,off,off` |
 | 首次切换时命令卡死（`mode-hang-on`） | 看门狗在下发时就启动：超时后按降级策略恢复播放，并打超时告警 |
 | 握手期间载入无标签文件 | `start-file` 提前取得暂停（探针在载入 0.5s 后就读到 `pause=true`） |
+| 旧 `on` 落地时新文件仍在加载 | 不从打开阶段启动元数据倒计时：加载完成前不做切换决定（调用 `status,on,off`，退出时才关） |
+| 首次状态查询卡死（`mode-hang-status`） | `query_timeout` 到期后按"查不到"放行：探针 `pause=false`，没有任何 on/off |
+| 旧查询丢弃后新文件加载失败 | 没有检测流程接管时，`end-file` 自己归还暂停（探针 `pause=false`） |
+| `on` 已生效但回读未知 | 记下"可能开启过"，退出时仍补关（`status,on,status,off`），`state.on` 最终不存在 |
+| 未知结算后切到 SDR | 快路径不再跳过：重新查询确认仍是 HDR 后下发 `off`（调用含 B 的 `status,off`） |
+| `on` 明确未能启动（init） | 不新增"可能开启"责任：退出不补关，`state.on` 保留，调用只有一次 `status` |
+| 查询超时后旧回调迟到 | 旧结果按尝试编号丢弃：不重启查询链（调用 `status,status,on,off`） |
+
+暂停保护类用例会在**保护期内**和**保护期结束后**各探一次（`TESTPROBE` / `TESTPROBE2`）：
+既要求"该暂停时暂停"，也要求"该放行时放行" —— 永久暂停不能靠只满足前半条蒙混过关。
 
 全部通过时退出码为 0，有失败项则为失败数量，方便接到别的地方跑。
 
@@ -86,8 +107,12 @@ pwsh -File .\test\real-machine.ps1 -KeepTemp    # 保留日志与脚本副本
 ```
 
 * **场景 A：状态查询在途时停止播放。** 为了在这台机器上稳定构造窗口，A 会把 `hdr_cmd_path`
-  指向一个运行时编译的薄包装：`status` 先睡 1.5 秒再调用**真实** HDRCmd（`on`/`off` 不受影响）。
+  指向一个运行时编译的薄包装：`status` 先睡 1.5 秒再调用**真实** HDRCmd；`on`/`off`
+  一律被包装器拦截并记录（返回非 0），所以即使 stop 晚了也不会真的黑屏，而这次竞速失败会
+  作为一条硬失败报出来。
   断言：停播回到空闲后 `pause=false`，日志出现「状态查询回调时文件已变化」，且没有切换 HDR。
+  A 会等包装器的 `status-done` 标记（查询真正返回）再退出：end-file 的暂停收尾可能在查询
+  返回前就放行，`pause=false` 不再能当作"查询已回调"的屏障。
 * **场景 B：后台关闭的黑屏握手期间打开 SDR。** 播放 HDR 片（脚本开 HDR）→ `stop` →
   等防抖关闭落地（显示器开始黑屏）→ 立刻 `loadfile` SDR 片。断言：新文件先被暂停
   （不会在黑屏里开播），握手结束后恢复播放且 `time-pos` 正常推进。
@@ -103,7 +128,7 @@ pwsh -File .\test\real-machine.ps1 -KeepTemp    # 保留日志与脚本副本
 会真的切换显示器，建议按顺序过一遍：
 
 1. **单部 HDR 片**：从片头开始播、不漏首帧；黑屏结束后画面就动。
-   若黑屏早就结束而画面还在等 → 调小 `handshake_delay_on`；画面亮了才开始播 → 调大。
+   若画面亮起时片头已经播掉一截 → 调大 `handshake_delay_on`；黑屏早结束了画面还在等 → 调小。
 2. **走元数据路径**（文件名预判覆盖不到的那条）：把 HDR 片复制一份，文件名里删掉 `HDR` / `DV` / `DoVi` 字样再播。
    日志应出现 `元数据检测：gamma=pq ... -> hdr`。
 3. **连播 3 集 HDR**：HDR 保持常亮，切集过程中不该有黑屏闪烁。
@@ -112,6 +137,8 @@ pwsh -File .\test\real-machine.ps1 -KeepTemp    # 保留日志与脚本副本
    拖回去继续播也不该触发重新判定。此时关闭 mpv 才恢复 SDR。
 6. **手动对抗**：播放中用 Win+Alt+B 自己开关 HDR，再切集 —— 脚本应以真实状态为准；
    片尾不要关掉你**手动**开的 HDR。
+   例外：如果 HDR 本来就是**脚本**开的，你随后手动关→开，脚本无法区分所有权，片尾仍可能
+   按"自己开的"去关 —— 这是已知能力边界（见 DEVELOPER.md 第 7 节），不算失败。
 7. **退出**：播放中点 ✕ 或按 `q`，立即恢复 SDR；任务管理器里不应残留 `HDRCmd.exe`。
 8. **拖动进度条 / 暂停继续**：日志里不应出现新的判定（路径去重生效）。
 9. **切断依赖时的表现**：把 `options.hdr_cmd_path` 临时改成一个不存在的路径，打开 HDR 片 ——

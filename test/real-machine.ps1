@@ -7,7 +7,10 @@
     两个场景：
       A  状态查询在途时停止播放 → 查询回调过期后，脚本自己的暂停必须归还（空闲时 pause=false）
          为了在这台机器上稳定构造"查询还没回来"的窗口，A 会把 status 换成
-         "先睡 1.5 秒再调用真实 HDRCmd" 的薄包装；on/off 仍然直接调用真实 HDRCmd。
+         "先睡 1.5 秒再调用真实 HDRCmd" 的薄包装；on/off 被包装器**拦截并记录**，
+         保证这条"不该切换"的用例即使竞速失败也不会真的黑屏。
+         注意：暂停可能在查询返回前就归还（end-file 收尾），所以 A 用测试副本在过期
+         分支写的 user-data 标记，确认 Lua 真的处理了回调后再退出。
       B  后台关闭 HDR（片尾防抖 off）落地后的黑屏握手期间打开 SDR 片
          → 新文件会被建立暂停，等握手结束才开播
 
@@ -97,22 +100,34 @@ function Wait-HdrState([int]$Wanted, [double]$TimeoutSec, [string]$What) {
 }
 
 # ---------- 慢速 status 包装（只给场景 A 用） ----------
+$blockedLog = Join-Path $work "blocked-switch.log"
+$statusDone = Join-Path $work "status-done.log"
 function New-SlowStatusWrapper {
     $exe = Join-Path $work "hdr-cmd-slowstatus.exe"
     $cs = Join-Path $work "slowstatus.cs"
     $code = @"
 using System;
 using System.Diagnostics;
+using System.IO;
 using System.Text;
 using System.Threading;
 
 internal static class SlowStatus
 {
     private const string Real = @"$HdrCmdPath";
+    private const string BlockLog = @"$blockedLog";
+    private const string StatusDone = @"$statusDone";
 
     private static int Main(string[] args)
     {
-        if (args.Length > 0 && args[0].ToLowerInvariant() == "status") Thread.Sleep(1500);
+        string cmd = args.Length > 0 ? args[0].ToLowerInvariant() : "";
+        if (cmd == "status") Thread.Sleep(1500);
+        if (cmd != "status")
+        {
+            // 场景 A 只验证"查询在途时 stop"：任何切换请求都不许落到真实显示器。
+            File.AppendAllText(BlockLog, DateTime.UtcNow.ToString("o") + " " + cmd + "\n");
+            return 3;
+        }
         var psi = new ProcessStartInfo(Real);
         var sb = new StringBuilder();
         foreach (var a in args)
@@ -125,6 +140,8 @@ internal static class SlowStatus
         psi.CreateNoWindow = true;
         var p = Process.Start(psi);
         p.WaitForExit();
+        // 告诉测试：status 已经返回，脚本的回调马上会处理（不能再拿 pause 当屏障）
+        File.WriteAllText(StatusDone, DateTime.UtcNow.ToString("o"));
         return p.ExitCode;
     }
 }
@@ -145,6 +162,18 @@ function New-ScriptCopy([string]$DirName, [string]$HdrCmdForScript) {
     $patched = $src.Replace('hdr_cmd_path = "C:\\Program Files\\mpv\\HDRCmd.exe"', 'hdr_cmd_path = "' + $escaped + '"')
     $patched = $patched.Replace('debug = false', 'debug = true')
     if ($patched -notmatch 'debug = true') { throw "脚本补丁没生效" }
+    # 场景 A 需要知道"过期查询分支真的执行了"：只改临时副本，在该分支写一个
+    # user-data 标记；产品脚本本身不增加测试代码。
+    $branchLine = '            log("状态查询回调时文件已变化，丢弃这次判定（%s）", trigger_reason)'
+    $withMarker = $patched.Replace($branchLine,
+        $branchLine + "`r`n            mp.set_property(`"user-data/auto_hdr_test_query_discarded`", `"1`")")
+    if ($withMarker -eq $patched) { throw "过期分支标记补丁没生效" }
+    $patched = $withMarker
+    # 解析实际赋值，确认副本真的指向包装器/HDRCmd（注释残留不算）
+    $m = [regex]::Match($patched, 'hdr_cmd_path = "([^"]*)"')
+    if (-not $m.Success -or $m.Groups[1].Value -ne $escaped) {
+        throw "脚本副本的 hdr_cmd_path 没有指向 $HdrCmdForScript"
+    }
     $path = Join-Path $dir "auto-hdr.lua"
     [System.IO.File]::WriteAllText($path, $patched, $utf8)
     return $path
@@ -247,6 +276,7 @@ function Log-Has($Ctx, [string]$Needle) { return ((Get-Log $Ctx) -like "*$Needle
 # ==================== 场景 A ====================
 function Invoke-ScenarioA {
     Say "`n=== A：状态查询在途时停止播放 ===" "Cyan"
+    Remove-Item $blockedLog, $statusDone -Force -ErrorAction SilentlyContinue
     $wrapper = New-SlowStatusWrapper
     $scriptA = New-ScriptCopy "scenario-a" $wrapper
     $ctx = Start-TestMpv $scriptA $HdrFile
@@ -270,6 +300,17 @@ function Invoke-ScenarioA {
         }
         if ($released) { Pass "过期查询返回后，空闲状态的暂停已归还（pause=false）" }
         else { Fail "过期查询返回后仍暂停" "5 秒内 pause 一直为 true" }
+
+        # end-file 的暂停收尾会在查询返回之前就放行，所以 pause=false 不再是
+        # "查询已回调"的屏障。等 Lua 真正执行过期分支（测试副本写的 user-data 标记），
+        # 不再用固定 sleep 猜回调有没有处理 —— status-done 只是诊断信息。
+        $processed = $false
+        try {
+            Wait-Until { (Get-MpvProp $ctx "user-data/auto_hdr_test_query_discarded") -eq "1" } 6 "Lua 丢弃过期查询"
+            $processed = $true
+        } catch { }
+        if ($processed) { Pass "Lua 已确认丢弃过期查询（user-data 标记）" }
+        else { Fail "未等到过期查询处理" "6 秒内没有 query-discarded 标记" }
     } finally {
         Stop-TestMpv $ctx
     }
@@ -279,6 +320,12 @@ function Invoke-ScenarioA {
     else { Fail "日志缺少过期分支" "没有出现「状态查询回调时文件已变化」" }
     if (Log-Has $ctx "HDR 已开启") { Fail "不应切 HDR" "过期判定居然下发了 on" }
     else { Pass "没有因过期判定切换 HDR" }
+    if (Test-Path $blockedLog) {
+        $blocked = ((Get-Content -LiteralPath $blockedLog -Raw).Trim() -replace "`r?`n", "；")
+        Fail "测试竞速失败：下发过切换命令" ("包装器已拦截：" + $blocked)
+    } else {
+        Pass "整个查询窗口内没有下发 on/off（真实 HDR 未被触碰）"
+    }
 }
 
 # ==================== 场景 B ====================
@@ -286,12 +333,19 @@ function Invoke-ScenarioB {
     Say "`n=== B：后台关闭的黑屏握手期间打开 SDR ===" "Cyan"
     $initial = Get-HdrState
     Say ("测试前系统 HDR：退出码 " + $initial + "（0=开 / 1=关 / 2=不支持）")
-    if ($initial -eq 2) { Fail "无 HDR 显示器" "HDRCmd status 返回 2，场景 B 无法进行"; return }
+    # 只接受明确的开/关：2 表示没有 HDR 显示器，其它值（3、-1 等）是查询失败。
+    # 状态未知时不能擅自"先关再开"——那会把用户的初始状态当成测试的恢复目标。
+    if ($initial -notin @(0, 1)) {
+        $why = if ($initial -eq 2) { "没有支持 HDR 的显示器" } else { "状态查询失败（约定外退出码）" }
+        Fail "场景 B 无法开始" ("HDRCmd status 返回 " + $initial + "：" + $why)
+        return
+    }
 
     $scriptB = New-ScriptCopy "scenario-b" $HdrCmdPath
     try {
-        if ($initial -ne 1) {
-            Set-HdrState $false | Out-Null
+        if ($initial -eq 0) {
+            $rc = Set-HdrState $false
+            if ($rc -ne 0) { throw "测试前置失败：关闭 HDR 返回 $rc" }
             Wait-HdrState 1 10 "把系统 HDR 关掉（测试前置）" | Out-Null
         }
         $ctx = Start-TestMpv $scriptB $HdrFile
@@ -316,7 +370,8 @@ function Invoke-ScenarioB {
             if ($sawPause) { Pass "握手期间打开的 SDR 文件被暂停（不会在黑屏里开播）" }
             else { Fail "SDR 文件没有被建立暂停" "载入后 2.5 秒内 pause 一直为 false" }
 
-            # 握手截止时间从 off 下发时算起（默认 3.9s），这里给足余量再要求恢复
+            # 握手从 off 下发时就开始，成功回调再以完成时间刷新 ——
+            # 实际停顿约"命令耗时 + 3.9 秒"，这里给足余量再要求恢复
             try {
                 Wait-Until { (Get-MpvProp $ctx "pause") -eq $false } 8 "握手结束后恢复播放"
                 Pass "握手结束后 SDR 文件恢复播放"
@@ -341,9 +396,23 @@ function Invoke-ScenarioB {
         if (Log-Has $ctx "SDR 内容且系统 HDR 非本脚本开启") { Pass "日志确认 SDR 走的是快路径" }
         else { Fail "日志缺少 SDR 快路径" "没有出现「SDR 内容且系统 HDR 非本脚本开启」" }
     } finally {
-        if ($initial -ne 1) {
+        if ($initial -eq 0) {
             Say "恢复测试前的系统 HDR 状态（打开）……"
-            Set-HdrState $true | Out-Null
+            $rc = Set-HdrState $true
+            if ($rc -ne 0) {
+                Fail "恢复测试前状态失败" "HDRCmd on 返回 $rc"
+            } else {
+                try { Wait-HdrState 0 10 "恢复为开启" | Out-Null }
+                catch { Fail "恢复测试前状态失败" $_.Exception.Message }
+            }
+        } elseif ($initial -eq 1) {
+            # 初态是关闭：结束时应当仍然是关闭（由被测脚本退出时关回）。
+            # 不能只假设它成功，失败要报出来并强制恢复初态。
+            try { Wait-HdrState 1 10 "结束时保持关闭（恢复初态）" | Out-Null }
+            catch {
+                Fail "结束未恢复初态" $_.Exception.Message
+                Set-HdrState $false | Out-Null
+            }
         }
     }
 }

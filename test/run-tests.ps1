@@ -49,6 +49,12 @@ $modeSlowExitOn = Join-Path $work "mode-slow-exit-on"
 $modeSlowExitSt = Join-Path $work "mode-slow-exit-status"
 $modeSlowReread = Join-Path $work "mode-slow-reread"
 $modeHangOn = Join-Path $work "mode-hang-on"
+$modeHangStatus = Join-Path $work "mode-hang-status"
+$modeOnEffectFail = Join-Path $work "mode-on-effect-then-fail"
+$modeRereadError = Join-Path $work "mode-reread-error"
+$modeManualOn = Join-Path $work "mode-manual-on-after-status"
+$modeSlowStatusOnce = Join-Path $work "mode-slow-status-once"
+$callsErrorPath = Join-Path $work "calls-log-error"
 $attemptPath = Join-Path $work "on-attempt"
 
 $stubSource = Join-Path $PSScriptRoot "stub-hdrcmd.cs"
@@ -79,6 +85,7 @@ $quitHelper  = Join-Path $work "testquit.lua"
 $stopHelper  = Join-Path $work "teststop.lua"
 $nextHelper  = Join-Path $work "testnext.lua"
 $probeHelper = Join-Path $work "testprobe.lua"
+$probe2Helper = Join-Path $work "testprobe2.lua"
 function Write-QuitHelper([int]$Seconds) {
     $lua = "mp.add_timeout($Seconds, function() mp.command(`"quit`") end)`r`n"
     [System.IO.File]::WriteAllText($quitHelper, $lua, $utf8NoBom)
@@ -95,11 +102,73 @@ function Write-ProbeHelper([double]$Seconds) {
     $lua = "mp.add_timeout($Seconds, function() mp.msg.info(`"TESTPROBE pause=`" .. tostring(mp.get_property_bool(`"pause`"))) end)`r`n"
     [System.IO.File]::WriteAllText($probeHelper, $lua, $utf8NoBom)
 }
+# 第二个探针：验证"等到该放行的时候真的放行了"，防止永久暂停也能满足前半条断言
+function Write-Probe2Helper([double]$Seconds) {
+    $lua = "mp.add_timeout($Seconds, function() mp.msg.info(`"TESTPROBE2 pause=`" .. tostring(mp.get_property_bool(`"pause`"))) end)`r`n"
+    [System.IO.File]::WriteAllText($probe2Helper, $lua, $utf8NoBom)
+}
 # 到点后加载另一个文件（模拟"防抖关闭还没落地，用户就打开了下一部"）
 $loadHelper = Join-Path $work "testload.lua"
 function Write-LoadHelper([double]$Seconds, [string]$File) {
     $lua = "mp.add_timeout($Seconds, function() mp.commandv(`"loadfile`", `"$($File -replace '\\','/')`") end)`r`n"
     [System.IO.File]::WriteAllText($loadHelper, $lua, $utf8NoBom)
+}
+
+# ---------- 2b. 慢加载用的本机 HTTP 服务 ----------
+# 连接立刻建立，但响应可以被故意拖后（或直接断开）：此时 mpv 的 path 已经有值、
+# file-loaded 却还没来 —— 用来构造"文件还在打开中"的真实窗口，不依赖网络环境。
+function Start-SlowHttp {
+    param([string]$File, [int]$DelayMs, [string]$Mode)
+    $tag = [guid]::NewGuid().ToString("N")
+    $ready = Join-Path $work "http-$tag.ready"
+    $stop = Join-Path $work "http-$tag.stop"
+    $job = Start-Job -ScriptBlock {
+        param($ReadyFile, $StopFile, $MediaFile, $DelayMs, $Mode)
+        $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+        $listener.Start()
+        try {
+            $port = ([System.Net.IPEndPoint]$listener.LocalEndpoint).Port
+            [System.IO.File]::WriteAllText($ReadyFile, [string]$port)
+            $first = $true
+            while (-not (Test-Path -LiteralPath $StopFile)) {
+                if (-not $listener.Pending()) { Start-Sleep -Milliseconds 50; continue }
+                $client = $listener.AcceptTcpClient()
+                try {
+                    $stream = $client.GetStream()
+                    $buf = New-Object byte[] 8192
+                    $stream.ReadTimeout = 3000
+                    try { $null = $stream.Read($buf, 0, $buf.Length) } catch {}
+                    # 只有第一条连接制造"加载中"的窗口；重试连接立刻处理，避免拖长用例
+                    if ($first) { Start-Sleep -Milliseconds $DelayMs; $first = $false }
+                    if ($Mode -eq "fail") { continue }
+                    $bytes = [System.IO.File]::ReadAllBytes($MediaFile)
+                    $head = "HTTP/1.1 200 OK`r`nContent-Type: audio/wav`r`nContent-Length: $($bytes.Length)`r`nConnection: close`r`n`r`n"
+                    $hb = [System.Text.Encoding]::ASCII.GetBytes($head)
+                    $stream.Write($hb, 0, $hb.Length)
+                    $stream.Write($bytes, 0, $bytes.Length)
+                    $stream.Flush()
+                } catch { } finally { try { $client.Close() } catch {} }
+            }
+        } finally { try { $listener.Stop() } catch {} }
+    } -ArgumentList $ready, $stop, $File, $DelayMs, $Mode
+
+    $deadline = (Get-Date).AddSeconds(15)
+    while (-not (Test-Path -LiteralPath $ready)) {
+        if ($job.State -eq "Failed" -or $job.State -eq "Completed") {
+            throw ("慢加载测试服务启动失败：" + ((Receive-Job $job 2>&1 | Out-String)))
+        }
+        if ((Get-Date) -gt $deadline) { throw "慢加载测试服务未就绪（15 秒）" }
+        Start-Sleep -Milliseconds 100
+    }
+    $port = (Get-Content -LiteralPath $ready -Raw).Trim()
+    return [pscustomobject]@{ Job = $job; Port = $port; StopFile = $stop }
+}
+
+function Stop-SlowHttp($Server) {
+    if (-not $Server) { return }
+    try { [System.IO.File]::WriteAllText($Server.StopFile, "stop") } catch {}
+    try { $Server.Job | Stop-Job -ErrorAction SilentlyContinue } catch {}
+    try { $Server.Job | Remove-Job -Force -ErrorAction SilentlyContinue } catch {}
 }
 
 # ---------- 3. 测试用的 auto-hdr.lua 副本（指向 stub、缩短握手、开 debug）----------
@@ -116,6 +185,12 @@ if ($patched -eq $src) { throw "补丁没生效：请检查脚本里的 options 
 if ($patched -notmatch 'handshake_delay_on = 0\.3' -or $patched -notmatch 'debug = true') {
     throw "补丁没打全：握手值或 debug 没换掉，测试会变慢/看不到日志"
 }
+# 只改了握手/debug 而路径没替换成功时，副本会去调用真实的 HDRCmd —— 必须硬失败。
+# 解析实际的赋值内容，避免"注释里残留同样字符串"也能蒙混过关。
+$pathMatch = [regex]::Match($patched, 'hdr_cmd_path = "([^"]*)"')
+if (-not $pathMatch.Success -or $pathMatch.Groups[1].Value -ne $stubLuaPath) {
+    throw "脚本副本的 hdr_cmd_path 没有指向测试替身：$stubLuaPath"
+}
 [System.IO.File]::WriteAllText($testScript, $patched, $utf8NoBom)
 
 # 握手 2.0 秒的副本：用来验证"物理握手跨文件有效"（0.3 秒太短，切集窗口构造不出来）。
@@ -126,6 +201,35 @@ $testScriptSlow = Join-Path $slowDir "auto-hdr.lua"
 $slow = $patched -replace 'handshake_delay_(on|off) = [0-9.]+', 'handshake_delay_$1 = 2.0'
 if ($slow -notmatch 'handshake_delay_on = 2\.0') { throw "慢握手补丁没生效" }
 [System.IO.File]::WriteAllText($testScriptSlow, $slow, $utf8NoBom)
+
+# 查询超时 0.5 秒的副本：验证"status 挂起时不能永久暂停"（默认 5 秒，用例等不起）。
+# 文件名同样必须是 auto-hdr.lua（日志前缀按文件名生成）。
+$fastQueryDir = Join-Path $work "fastquery"
+New-Item -ItemType Directory -Path $fastQueryDir | Out-Null
+$testScriptFastQuery = Join-Path $fastQueryDir "auto-hdr.lua"
+$fastQuery = $patched -replace 'query_timeout = [0-9.]+', 'query_timeout = 0.5'
+if ($fastQuery -notmatch 'query_timeout = 0\.5') { throw "查询超时补丁没生效" }
+[System.IO.File]::WriteAllText($testScriptFastQuery, $fastQuery, $utf8NoBom)
+
+# 超时后不 abort 的副本：让迟到的 status 结果真的返回，验证"尝试编号"能挡住旧回调。
+$abortNeedle = "                mp.abort_async_command(req)     -- 只请求结束进程；迟到回调会被上面的编号挡住"
+$noAbort = $fastQuery.Replace($abortNeedle, "                -- (test) 不 abort：让迟到回调真的到达")
+if ($noAbort -eq $fastQuery) { throw "no-abort 补丁没生效" }
+$noAbortDir = Join-Path $work "noabort"
+New-Item -ItemType Directory -Path $noAbortDir | Out-Null
+$testScriptNoAbort = Join-Path $noAbortDir "auto-hdr.lua"
+[System.IO.File]::WriteAllText($testScriptNoAbort, $noAbort, $utf8NoBom)
+
+# "on 进程没能启动"的副本：只把 on 的可执行路径换成不存在的文件，模拟 CreateProcess
+# 失败（error_string == "init"）；status/off 仍然走 stub。
+$initFailDir = Join-Path $work "initfail"
+New-Item -ItemType Directory -Path $initFailDir | Out-Null
+$testScriptInitFail = Join-Path $initFailDir "auto-hdr.lua"
+$needle = "local function hdrcmd_args(extra)`r`n    local args = {options.hdr_cmd_path}"
+$replacement = $needle + "`r`n    if extra[1] == `"on`" then args[1] = `"C:/no-such-dir/HDRCmd.exe`" end"
+$initFail = $patched.Replace($needle, $replacement)
+if ($initFail -eq $patched) { throw "init 失败副本补丁没生效" }
+[System.IO.File]::WriteAllText($testScriptInitFail, $initFail, $utf8NoBom)
 
 # 同一份脚本、但 hdr_cmd_path 指向不存在的文件：验证"查不到状态就旁路"
 # 注意两点：用正斜杠（Lua 字符串里 "\n" 是换行、"\H" 是非法转义，写反斜杠会把脚本写坏）；
@@ -156,6 +260,9 @@ New-SilentWav (Join-Path $work "ep2.DoVi.wav")   3
 New-SilentWav (Join-Path $work "plain.wav")      3
 New-SilentWav (Join-Path $work "long.HDR.wav")   30
 New-SilentWav (Join-Path $work "movie.HDRip.wav") 3
+# 慢加载用例通过本机 HTTP 提供：连接立刻建立，但响应可以被故意拖后 / 直接断开
+New-SilentWav (Join-Path $work "slow.HDR.wav") 3
+New-SilentWav (Join-Path $work "slow.wav")     3
 
 # 真实视频（音频文件没有 video-params，测不到元数据判定）
 $testVideo     = "av://lavfi:testsrc=size=64x64:rate=5:duration=2"
@@ -164,7 +271,9 @@ $testLongVideo = "av://lavfi:testsrc=size=64x64:rate=5:duration=30"
 # ---------- 工具函数 ----------
 function Reset-Stub {
     Remove-Item $callsPath, $statePath, $attemptPath, $modeFail, $modeNoHdr, $modeOffFail, $modeSlowOn, `
-        $modeSlowSt, $modeSlowOff, $modeSlowExitOn, $modeSlowExitSt, $modeSlowReread, $modeHangOn `
+        $modeSlowSt, $modeSlowOff, $modeSlowExitOn, $modeSlowExitSt, $modeSlowReread, $modeHangOn, `
+        $modeHangStatus, $modeOnEffectFail, $modeRereadError, $modeManualOn, $modeSlowStatusOnce, $callsErrorPath, `
+        (Join-Path $work "reread-error-used"), (Join-Path $work "status-count") `
         -Force -ErrorAction SilentlyContinue
 }
 function Set-StubMode([string]$Mode) {
@@ -180,6 +289,11 @@ function Set-StubMode([string]$Mode) {
     if ($modes -contains "slowexitstatus")  { New-Item -ItemType File -Path $modeSlowExitSt | Out-Null }
     if ($modes -contains "slowreread")      { New-Item -ItemType File -Path $modeSlowReread | Out-Null }
     if ($modes -contains "hangon")          { New-Item -ItemType File -Path $modeHangOn | Out-Null }
+    if ($modes -contains "hangstatus")      { New-Item -ItemType File -Path $modeHangStatus | Out-Null }
+    if ($modes -contains "oneffectfail")    { New-Item -ItemType File -Path $modeOnEffectFail | Out-Null }
+    if ($modes -contains "rereaderror")     { New-Item -ItemType File -Path $modeRereadError | Out-Null }
+    if ($modes -contains "manualon")        { New-Item -ItemType File -Path $modeManualOn | Out-Null }
+    if ($modes -contains "slowstatusonce")  { New-Item -ItemType File -Path $modeSlowStatusOnce | Out-Null }
 }
 function Get-Calls {
     if (-not (Test-Path $callsPath)) { return @() }
@@ -194,6 +308,7 @@ function Invoke-Mpv {
         [int]$StopAfter = 0,
         [double]$NextAfter = 0,
         [double]$ProbeAfter = 0,
+        [double]$Probe2After = 0,
         [double]$LoadAfter = 0,
         [string]$LoadFile = "",
         [string]$ScriptPath = $testScript
@@ -205,6 +320,7 @@ function Invoke-Mpv {
     if ($StopAfter -gt 0)  { Write-StopHelper $StopAfter;   $helpers += $stopHelper }
     if ($NextAfter -gt 0)  { Write-NextHelper $NextAfter;   $helpers += $nextHelper }
     if ($ProbeAfter -gt 0) { Write-ProbeHelper $ProbeAfter; $helpers += $probeHelper }
+    if ($Probe2After -gt 0) { Write-Probe2Helper $Probe2After; $helpers += $probe2Helper }
     if ($LoadAfter -gt 0)  { Write-LoadHelper $LoadAfter $LoadFile; $helpers += $loadHelper }
     $mpvArgs = @("--no-config", "--vo=null", "--ao=null", "--keep-open=yes",
                  "--script=$ScriptPath") + ($helpers | ForEach-Object { "--script=$_" }) + $Extra + $Files
@@ -213,8 +329,8 @@ function Invoke-Mpv {
     if (-not $p.WaitForExit(30000)) { $p.Kill(); return @("[超时] mpv 未在 30 秒内退出") }
     $text = [System.IO.File]::ReadAllText($outFile, [System.Text.Encoding]::UTF8) + "`n" +
             [System.IO.File]::ReadAllText($errFile, [System.Text.Encoding]::UTF8)
-    return @($text -split "`r?`n" | Where-Object { $_ -match '^\[(auto_hdr|testprobe)\]' } |
-             ForEach-Object { $_ -replace '^\[(auto_hdr|testprobe)\]\s*', '' })
+    return @($text -split "`r?`n" | Where-Object { $_ -match '^\[(auto_hdr|testprobe|testprobe2)\]' } |
+             ForEach-Object { $_ -replace '^\[(auto_hdr|testprobe|testprobe2)\]\s*', '' })
 }
 
 $script:results = @()
@@ -233,6 +349,7 @@ function Test-Case {
         [int]$StopAfter = 0,
         [double]$NextAfter = 0,
         [double]$ProbeAfter = 0,
+        [double]$Probe2After = 0,
         [double]$LoadAfter = 0,
         [string]$LoadFile = "",
         [switch]$BadPath,
@@ -241,7 +358,16 @@ function Test-Case {
         [string[]]$Expect = @(),
         [string[]]$ExpectAbsent = @(),
         [string]$CallsMatch = "",
-        [string]$CallsAbsent = ""
+        [string]$CallsAbsent = "",
+        [switch]$FastQuery,          # 查询超时 0.5 秒的副本
+        [switch]$InitFailCopy,       # on 的可执行路径指向不存在文件的副本（模拟 init 失败）
+        [switch]$NoAbortCopy,        # 超时后不 abort 的副本（让迟到回调真的到达）
+        [switch]$SlowHttp,           # 用本机 HTTP 服务构造"文件还在打开中"
+        [string]$HttpFile = "slow.HDR.wav",
+        [string]$HttpName = "slow.HDR.wav",
+        [int]$HttpDelayMs = 4000,
+        [ValidateSet("serve", "fail")] [string]$HttpMode = "serve",
+        [ValidateSet("", "on", "off")] [string]$StubState = ""
     )
     Reset-Stub
     Set-StubMode $Mode
@@ -253,12 +379,26 @@ function Test-Case {
         $files += ($Media | ForEach-Object { Join-Path $work $_ })
     }
 
-    $log = Invoke-Mpv -Files $files -QuitAfter $QuitAfter -Extra $Extra -StopAfter $StopAfter `
-                      -NextAfter $NextAfter -ProbeAfter $ProbeAfter `
-                      -LoadAfter $LoadAfter -LoadFile $LoadFile `
-                      -ScriptPath $(if ($BadPath) { $testScriptBad }
-                                    elseif ($SlowHandshake) { $testScriptSlow }
-                                    else { $testScript })
+    $scriptPath = if ($BadPath) { $testScriptBad }
+                  elseif ($InitFailCopy) { $testScriptInitFail }
+                  elseif ($NoAbortCopy) { $testScriptNoAbort }
+                  elseif ($FastQuery) { $testScriptFastQuery }
+                  elseif ($SlowHandshake) { $testScriptSlow }
+                  else { $testScript }
+
+    $server = $null
+    try {
+        if ($SlowHttp) {
+            $server = Start-SlowHttp -File (Join-Path $work $HttpFile) -DelayMs $HttpDelayMs -Mode $HttpMode
+            $LoadFile = "http://127.0.0.1:$($server.Port)/$HttpName"
+        }
+        $log = Invoke-Mpv -Files $files -QuitAfter $QuitAfter -Extra $Extra -StopAfter $StopAfter `
+                          -NextAfter $NextAfter -ProbeAfter $ProbeAfter -Probe2After $Probe2After `
+                          -LoadAfter $LoadAfter -LoadFile $LoadFile `
+                          -ScriptPath $scriptPath
+    } finally {
+        Stop-SlowHttp $server
+    }
     $logText = ($log -join "`n")
     $calls = Get-Calls
     $callsText = ($calls -join ",")
@@ -268,6 +408,14 @@ function Test-Case {
     foreach ($e in $ExpectAbsent) { if ($logText -like    "*$e*") { $problems += "日志不该出现「$e」" } }
     if ($CallsMatch  -and $callsText -notmatch $CallsMatch)  { $problems += "调用序列不符：期望匹配 /$CallsMatch/，实际 [$callsText]" }
     if ($CallsAbsent -and $callsText -match    $CallsAbsent) { $problems += "不该出现该调用：/$CallsAbsent/ 命中 [$callsText]" }
+    if (Test-Path $callsErrorPath) { $problems += "替身调用日志写入失败（见 calls-log-error），调用序列不可信" }
+    if ($StubState) {
+        $actualOn = Test-Path $statePath
+        $expectOn = $StubState -eq "on"
+        if ($actualOn -ne $expectOn) {
+            $problems += "替身最终状态不符：期望 $StubState，实际 $(if ($actualOn) { 'on' } else { 'off' })"
+        }
+    }
 
     $detail = ""
     if ($problems.Count -gt 0) {
@@ -371,16 +519,18 @@ Test-Case -Name "--pause 启动 → 脚本不解除用户的暂停" -Media @("mo
 # A 已开启 HDR、显示器还在黑屏里，用户切到下一部 HDR 片：
 # 新片不能因为"系统状态已经是 HDR"就立刻开播，必须继承剩余的握手时间。
 Test-Case -Name "握手等待期间切到下一部 HDR 片 → 继续等剩余时间" -SlowHandshake `
-    -NextAfter 0.6 -ProbeAfter 1.0 -QuitAfter 8 `
+    -NextAfter 0.6 -ProbeAfter 1.0 -Probe2After 4.0 -QuitAfter 8 `
     -List @("long.HDR.wav", "movie.HDR.wav") `
-    -Expect @("TESTPROBE pause=true") -ExpectAbsent @("TESTPROBE pause=false")
+    -Expect @("TESTPROBE pause=true", "TESTPROBE2 pause=false") `
+    -ExpectAbsent @("TESTPROBE pause=false", "TESTPROBE2 pause=true")
 
 # 上一部影片的 on 在切集之后才落地（副作用已发生、回调晚到）：
 # 重判路径同样要沿用握手，不能立即解除暂停。
 Test-Case -Name "上一部 on 在切集后才落地 → 重判也等握手" -SlowHandshake -Mode "slowexit" `
-    -NextAfter 0.6 -ProbeAfter 2.0 -QuitAfter 8 `
+    -NextAfter 0.6 -ProbeAfter 2.0 -Probe2After 5.0 -QuitAfter 8 `
     -List @("long.HDR.wav", "movie.HDR.wav") `
-    -Expect @("TESTPROBE pause=true") -ExpectAbsent @("TESTPROBE pause=false")
+    -Expect @("TESTPROBE pause=true", "TESTPROBE2 pause=false") `
+    -ExpectAbsent @("TESTPROBE pause=false", "TESTPROBE2 pause=true")
 
 # on 已经改了系统状态、回调还没回来时退出：不能因为 script_turned_on 还是 false 就漏关，
 # 否则退出后系统会停在 HDR。
@@ -415,15 +565,17 @@ Test-Case -Name "状态查询在途时 stop → 空闲归还脚本暂停" -Mode 
 
 # on 比握手时长还慢时切到 SDR：定时器不能只看截止时间，命令未结算前不得放行
 Test-Case -Name "on 慢于握手时长时切到 SDR → 命令落地前不放行" -Mode "slowon" `
-    -NextAfter 0.6 -ProbeAfter 1.0 -QuitAfter 8 -Extra @("--idle=yes") `
+    -NextAfter 0.6 -ProbeAfter 1.0 -Probe2After 4.0 -QuitAfter 8 -Extra @("--idle=yes") `
     -List @("long.HDR.wav", $testLongVideo) `
-    -Expect @("TESTPROBE pause=true") -ExpectAbsent @("TESTPROBE pause=false")
+    -Expect @("TESTPROBE pause=true", "TESTPROBE2 pause=false") `
+    -ExpectAbsent @("TESTPROBE pause=false", "TESTPROBE2 pause=true")
 
 # 后台 off 的握手还没结束时打开 SDR：没有现成暂停，也要为它建立播放保护
 Test-Case -Name "后台 off 握手期间打开 SDR → 建立暂停" -SlowHandshake -Mode "slowoff" `
-    -StopAfter 1 -LoadAfter 5.4 -LoadFile $testLongVideo -ProbeAfter 6.0 -QuitAfter 10 `
+    -StopAfter 1 -LoadAfter 5.4 -LoadFile $testLongVideo -ProbeAfter 6.0 -Probe2After 9.0 -QuitAfter 10 `
     -Extra @("--idle=yes") -Media @("long.HDR.wav") `
-    -Expect @("TESTPROBE pause=true") -ExpectAbsent @("TESTPROBE pause=false")
+    -Expect @("TESTPROBE pause=true", "TESTPROBE2 pause=false") `
+    -ExpectAbsent @("TESTPROBE pause=false", "TESTPROBE2 pause=true")
 
 # on 非零退出、回读期间退出：在途计数要到"结算"才减，否则会漏掉退出清理
 Test-Case -Name "on 失败回读期间退出 → 仍然补关" -Mode "fail,slowreread" -QuitAfter 1 `
@@ -443,8 +595,69 @@ Test-Case -Name "首次切换命令卡死 → 超时后恢复播放" -Mode "hang
 # 无 HDR 标签的文件在握手期间载入：从加载那一刻就该暂停，而不是等元数据检测（1.5s）完
 Test-Case -Name "握手期间载入无标签文件 → 加载时就暂停" -SlowHandshake -Mode "slowoff" `
     -StopAfter 1 -LoadAfter 5.4 -LoadFile (Join-Path $work "plain.wav") -ProbeAfter 5.9 `
-    -QuitAfter 10 -Extra @("--idle=yes") -Media @("long.HDR.wav") `
-    -Expect @("TESTPROBE pause=true") -ExpectAbsent @("TESTPROBE pause=false")
+    -Probe2After 9.0 -QuitAfter 10 -Extra @("--idle=yes") -Media @("long.HDR.wav") `
+    -Expect @("TESTPROBE pause=true", "TESTPROBE2 pause=false") `
+    -ExpectAbsent @("TESTPROBE pause=false", "TESTPROBE2 pause=true")
+
+# ---------- 第六轮：查询超时 / 加载阶段重判 / 卸载收尾 / 未知 on ----------
+
+# 上一部影片的 on 在切集后才落地，而新文件还在打开中（网络、慢盘）：
+# path 非空不等于"已加载"。提前启动元数据倒计时会让慢文件被过早定案，
+# 而且 current_playing_path 会把随后真正的加载挡掉。
+# 这里不要求 B 加载完，只要求"加载完成前不做出任何切换决定"。
+Test-Case -Name "旧 on 落地时新文件仍在加载 → 不提前定案" -Mode "slowexit" `
+    -Media @("long.HDR.wav") -LoadAfter 0.6 -SlowHttp -HttpFile "slow.wav" -HttpName "slow.wav" `
+    -HttpDelayMs 6000 -HttpMode fail -QuitAfter 4 `
+    -Expect @("当前文件尚未加载完成", "mpv 退出：关闭系统 HDR") `
+    -ExpectAbsent @("元数据超时") `
+    -CallsMatch "^status,on,off$"
+
+# 首次 status 挂起：file-loaded 已经锁了画面，但没有切换命令，所以"切换看门狗"
+# 根本不会启动。查询链自己必须有超时，否则画面永久暂停。
+Test-Case -Name "首次状态查询卡死 → 超时后恢复播放" -Mode "hangstatus" -FastQuery `
+    -Media @("movie.HDR.wav") -ProbeAfter 2 -QuitAfter 4 `
+    -Expect @("TESTPROBE pause=false", "系统 HDR 状态查询超时", "跳过本次切换") `
+    -ExpectAbsent @("TESTPROBE pause=true", "HDR 已开启") `
+    -CallsMatch "^status$"
+
+# 旧查询因为"新文件正在加载"而放弃收尾，随后新文件加载失败：
+# 不会再有任何检测流程接管暂停，end-file 必须自己收尾。
+Test-Case -Name "旧查询丢弃后新文件加载失败 → 归还暂停" -Mode "slowstatus" `
+    -Media @("long.HDR.wav") -LoadAfter 0.6 -SlowHttp -HttpFile "slow.wav" -HttpName "slow.wav" `
+    -HttpDelayMs 2500 -HttpMode fail -ProbeAfter 5 -QuitAfter 7 -Extra @("--idle=yes") `
+    -Expect @("TESTPROBE pause=false") -ExpectAbsent @("TESTPROBE pause=true") `
+    -CallsMatch "^status$"
+
+# on 已经改了系统状态、进程却异常结束，随后的回读也拿不到状态（nil）：
+# 不能当成"确认失败"。退出时仍要尝试恢复 SDR，否则系统停在 HDR。
+Test-Case -Name "on 已生效但回读未知 → 退出仍补关" -Mode "oneffectfail,rereaderror" `
+    -Media @("long.HDR.wav") -QuitAfter 5 `
+    -Expect @("HDR 开启结果未知", "mpv 退出：关闭系统 HDR") -ExpectAbsent @("HDR 已开启") `
+    -CallsMatch "^status,on,status,off$" -StubState "off"
+
+# 未知结算（on 已生效、回读 nil）后切到 SDR：快路径不能把"可能由脚本开启"的 HDR 跳过。
+# 修复后会用真实查询确认系统仍是 HDR 并下发 off；只在退出时补关不算通过。
+Test-Case -Name "未知结算后切到 SDR → 重查并关闭残留 HDR" -Mode "oneffectfail,rereaderror" `
+    -List @("long.HDR.wav", $testLongVideo) -NextAfter 2 -QuitAfter 6 `
+    -Expect @("HDR 开启结果未知", "HDR 已关闭（元数据") `
+    -ExpectAbsent @("HDR 已开启") `
+    -CallsMatch "^status,on,status,status,off$" -StubState "off"
+
+# on 明确没能启动（CreateProcess 失败，error_string=init）：不可能有开启副作用。
+# 即使随后的回读失败，也不能新增"可能开启"的责任，更不能在退出时关掉用户手动开的 HDR。
+Test-Case -Name "on 明确未能启动 → 不新增未知责任" -Mode "manualon,rereaderror" -InitFailCopy `
+    -Media @("long.HDR.wav") -QuitAfter 5 `
+    -Expect @("HDR 开启命令未能启动") `
+    -ExpectAbsent @("HDR 开启结果未知", "HDR 已开启") `
+    -CallsMatch "^status$" -StubState "on"
+
+# 首次查询超时后立刻开始新查询，旧查询的结果迟到（副本不 abort）：
+# 必须按尝试编号丢弃，不能重启查询链，也不能覆盖新链的结果。
+Test-Case -Name "查询超时后旧回调迟到 → 不污染新链" -Mode "slowstatusonce" -FastQuery -NoAbortCopy `
+    -List @("long.HDR.wav", "movie.HDR.wav") -NextAfter 0.7 -QuitAfter 5 `
+    -Expect @("系统 HDR 状态查询超时", "HDR 已开启") `
+    -ExpectAbsent @("读数作废并重查") `
+    -CallsMatch "^status,status,on,off$"
 
 # ---------- 汇总 ----------
 Write-Host ""
